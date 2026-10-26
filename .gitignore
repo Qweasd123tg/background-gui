@@ -1,0 +1,30 @@
+# Python bytecode and development environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime sessions and private observation data
+sessions/
+observers/
+state/
+runtime/
+screenshots/
+*.log
+*.ready.json
+preview*.png
+preview*.json
+
+# Locally built compositor/client artifacts
+/build/
+/target/
+/cache/
+*.rpm
+*.tar.gz
+/assets/bin/
+
+# Editor/OS local files
+.idea/
+.vscode/
+.DS_Store

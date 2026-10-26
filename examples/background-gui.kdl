@@ -1,0 +1,15 @@
+// Include from your host niri config before opening the observer.
+// If Agent is already declared elsewhere, keep only one declaration.
+workspace "Agent"
+
+window-rule {
+    match app-id=r#"^dev\.codex\.BackgroundGuiViewer$"#
+    open-on-workspace "Agent"
+    open-focused false
+    default-column-width { proportion 0.5; }
+    open-maximized false
+    focus-ring { off; }
+    border { off; }
+    geometry-corner-radius 22
+    clip-to-geometry true
+}

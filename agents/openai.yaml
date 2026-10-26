@@ -1,0 +1,4 @@
+interface:
+  display_name: "Background GUI"
+  short_description: "Test Linux apps with a live view on the Agent workspace"
+  default_prompt: "Use $background-gui to launch and test this Linux app with a live view on the Agent workspace."
