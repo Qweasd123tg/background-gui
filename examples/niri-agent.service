@@ -1,0 +1,14 @@
+[Unit]
+Description=Niri with window-addressed AgentInput (separate test session)
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+Wants=xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target
+
+[Service]
+Slice=session.slice
+Type=notify
+ExecCondition=/usr/bin/sh -c '! /usr/bin/systemctl --user --quiet is-active niri.service'
+ExecStart=%h/.local/lib/background-gui-host/niri-bd6e39f3/bin/niri --session --config %h/.config/niri/agent-input.kdl

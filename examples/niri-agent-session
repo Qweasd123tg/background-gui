@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -Eeuo pipefail
+
+task_home="${HOME:?HOME is required}"
+task_install="${BGUI_NIRI_INSTALL_DIR:-$task_home/.local/lib/background-gui-host/niri-bd6e39f3}"
+task_binary="$task_install/bin/niri"
+task_config="${BGUI_NIRI_CONFIG:-${XDG_CONFIG_HOME:-$task_home/.config}/niri/agent-input.kdl}"
+task_unit="${BGUI_NIRI_SYSTEMD_UNIT:-niri-agent.service}"
+
+verify_installation() {
+    if [[ ! -x "$task_binary" ]]; then
+        printf 'Patched niri executable not found: %s\n' "$task_binary" >&2
+        return 1
+    fi
+    if [[ -f "$task_install/build.json" ]]; then
+        python3 - "$task_install" <<'PY'
+from pathlib import Path
+import hashlib, json, sys
+root = Path(sys.argv[1])
+manifest = json.loads((root / 'build.json').read_text())
+if hashlib.sha256((root / 'bin/niri').read_bytes()).hexdigest() != manifest['binary_sha256']:
+    raise SystemExit('Niri binary digest mismatch')
+print('Verified AgentInput build:', manifest['integration_commit'])
+PY
+    fi
+    "$task_binary" validate --config "$task_config"
+}
+
+if [[ "${1:-}" == "--check" ]]; then
+    verify_installation
+    "$task_binary" --version
+    exit 0
+fi
+if [[ $# -gt 1 || ( $# -eq 1 && "${1:-}" != "--login" ) ]]; then
+    printf '%s\n' 'Usage: niri-agent-session [--check]' >&2
+    exit 2
+fi
+
+# Starting this launcher from a running desktop must never replace that desktop.
+for task_existing_unit in niri.service "$task_unit" graphical-session.target; do
+    if systemctl --user --quiet is-active "$task_existing_unit"; then
+        printf 'Already running: %s. Choose Niri AgentInput from GDM after logging out.\n' "$task_existing_unit" >&2
+        exit 1
+    fi
+done
+
+# Preserve the normal niri-session login-shell initialization.
+if [[ "${1:-}" != "--login" ]]; then
+    task_login_shell="$(getent passwd "$(id -u)" | cut -d: -f7)"
+    if [[ -x "$task_login_shell" ]] && grep -Fqx "$task_login_shell" /etc/shells; then
+        exec "$task_login_shell" -l -c 'exec "$@"' niri-agent-login "$0" --login
+    fi
+fi
+
+verify_installation
+task_original_path="$PATH"
+export PATH="$task_install/bin:$PATH"
+export XDG_CURRENT_DESKTOP=niri
+export XDG_SESSION_TYPE=wayland
+export NIRI_AGENT_SESSION=1
+unset WAYLAND_DISPLAY DISPLAY NIRI_SOCKET
+
+# A fresh user manager may not have loaded this unit yet. The actual start
+# below loads it; clearing an earlier failure is only a best-effort step.
+systemctl --user reset-failed "$task_unit" 2>/dev/null || true
+systemctl --user import-environment
+if command -v dbus-update-activation-environment >/dev/null; then
+    dbus-update-activation-environment --all
+fi
+
+finish_session() {
+    task_status=$?
+    trap - EXIT
+    systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target || true
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET NIRI_AGENT_SESSION || true
+    systemctl --user set-environment "PATH=$task_original_path" || true
+    exit "$task_status"
+}
+trap finish_session EXIT
+systemctl --user --wait start "$task_unit"

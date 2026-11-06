@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Control an owned headless Weston -> niri session, without host input fallback."""
+"""Computer use in an isolated display or an explicitly attached patched niri window."""
 from __future__ import annotations
 
 import argparse
@@ -349,6 +349,11 @@ def stop_owned(path, state):
 
 
 def start(args):
+    if args.backend == "host-background":
+        import host_background
+        return host_background.start(args, sys.modules[__name__])
+    if args.window is not None:
+        raise GuiError("--window is only valid with --backend host-background")
     label = session_name(args.name) if args.name is not None else None
     for name in RUNTIME_TOOLS:
         if not shutil.which(name):
@@ -362,7 +367,7 @@ def start(args):
     if not runtime_parent.is_dir() or len(str(runtime_parent)) > 50:
         runtime_parent = Path(tempfile.gettempdir())
     runtime = Path(tempfile.mkdtemp(prefix="cbg-", dir=runtime_parent))
-    state = {"id": session, "status": "starting", "runtime": str(runtime),
+    state = {"id": session, "backend": "isolated", "status": "starting", "runtime": str(runtime),
              "bus_address": "unix:path=" + str(runtime / "bus"), "processes": [],
              "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
              "width": args.width, "height": args.height,
@@ -524,8 +529,41 @@ def unwatch(state):
             "closed": not hubs["errors"] and all(item["status"] in ("stopped", "already-stopped") for item in results)}
 
 
+def launch_command(args, path, state, env):
+    argv = command_argv(args)
+    if args.cwd is not None and not Path(args.cwd).is_dir():
+        raise GuiError("--cwd must be an existing directory")
+    label = ("app-" if args.command in ("run", "launch") else "exec-") + uuid.uuid4().hex[:10]
+    proc, record = spawn_owned(path, state, argv, env, label, args.cwd)
+    if args.command in ("run", "launch"):
+        time.sleep(.1)
+        return {"session": state["id"], "pid": proc.pid, "running": proc.poll() is None,
+                "returncode": proc.poll(), "log": record["log"]}
+    try:
+        returncode = proc.wait(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        cleanup = terminate_group(record, state["id"])
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise GuiError(f"exec timed out after {args.timeout}s; cleanup={cleanup}; log: {record['log']}")
+    with Path(record["log"]).open("rb") as log:
+        output = log.read(1024 * 1024 + 1)
+    return {"returncode": returncode, "log": record["log"],
+            "output": output[:1024 * 1024].decode(errors="replace"),
+            "output_truncated": len(output) > 1024 * 1024}
+
+
 def operate(args):
+    if args.command == "stop":
+        path = session_dir(args.session)
+        if read_state(path).get("backend") == "host-background":
+            (path / "stop.requested").touch(mode=0o600)
     with locked_session(args.session) as (path, state):
+        if state.get("backend") == "host-background":
+            import host_background
+            return host_background.operate(args, path, state, sys.modules[__name__])
         if args.command == "stop":
             return stop_owned(path, state)
         if args.command == "status":
@@ -544,31 +582,10 @@ def operate(args):
         if args.command == "unwatch":
             return unwatch(state)
         env = isolated_env(state)
-        if args.command in ("run", "exec"):
-            argv = command_argv(args)
-            if args.cwd is not None and not Path(args.cwd).is_dir():
-                raise GuiError("--cwd must be an existing directory")
-            if args.command == "run":
-                label = "app-" + uuid.uuid4().hex[:10]
-                proc, record = spawn_owned(path, state, argv, env, label, args.cwd)
-                time.sleep(.1)
-                return {"session": state["id"], "pid": proc.pid, "running": proc.poll() is None,
-                        "returncode": proc.poll(), "log": record["log"]}
-            proc, record = spawn_owned(path, state, argv, env, "exec-" + uuid.uuid4().hex[:10], args.cwd)
-            try:
-                returncode = proc.wait(timeout=args.timeout)
-            except subprocess.TimeoutExpired:
-                cleanup = terminate_group(record, state["id"])
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-                raise GuiError(f"exec timed out after {args.timeout}s; cleanup={cleanup}; log: {record['log']}")
-            with Path(record["log"]).open("rb") as log:
-                output = log.read(1024 * 1024 + 1)
-            return {"returncode": returncode, "log": record["log"],
-                    "output": output[:1024 * 1024].decode(errors="replace"),
-                    "output_truncated": len(output) > 1024 * 1024}
+        if args.command in ("run", "launch", "exec"):
+            return launch_command(args, path, state, env)
+        if args.command == "drag":
+            raise GuiError("drag currently requires a host-background session")
         if args.command == "windows":
             return niri_json(state, "windows")
         if args.command == "focus":
@@ -616,13 +633,17 @@ def operate(args):
 def parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("doctor", help="Check installed runtime and pointer build dependencies")
-    start_p = commands.add_parser("start", help="Create a unique invisible desktop")
+    doctor = commands.add_parser("doctor", help="Check backend prerequisites")
+    doctor.add_argument("--backend", choices=("isolated", "host-background"), default="isolated")
+    commands.add_parser("stop-host", help="Detach the current host compositor's background agent (hotkey target)")
+    start_p = commands.add_parser("start", help="Create an isolated display or attach to patched host niri")
     start_p.add_argument("--width", type=int, default=1280)
     start_p.add_argument("--height", type=int, default=800)
     start_p.add_argument("--name", help="Human-readable project or task label")
-    for name in ("run", "exec"):
-        sub = commands.add_parser(name, help="Launch argv in isolated desktop" + (" and wait" if name == "exec" else ""))
+    start_p.add_argument("--backend", choices=("isolated", "host-background"), default="isolated")
+    start_p.add_argument("--window", type=int, help="Existing host window ID for host-background")
+    for name in ("run", "launch", "exec"):
+        sub = commands.add_parser(name, help="Launch argv in the selected session" + (" and wait" if name == "exec" else ""))
         sub.add_argument("session")
         sub.add_argument("--cwd")
         if name == "exec":
@@ -638,9 +659,17 @@ def parser():
         sub = commands.add_parser(name); sub.add_argument("session"); sub.add_argument("x", type=int); sub.add_argument("y", type=int)
         if name == "click":
             sub.add_argument("--button", choices=("left", "right", "middle"), default="left")
+    drag = commands.add_parser("drag", help="Drag inside the host-background target")
+    drag.add_argument("session")
+    for coordinate in ("x", "y", "end_x", "end_y"):
+        drag.add_argument(coordinate, type=int)
+    drag.add_argument("--duration", type=float, default=.5)
+    drag.add_argument("--button", choices=("left", "right", "middle"), default="left")
     scroll = commands.add_parser("scroll"); scroll.add_argument("session")
     scroll.add_argument("--vertical", type=float, default=0); scroll.add_argument("--horizontal", type=float, default=0)
     typing = commands.add_parser("type"); typing.add_argument("session"); typing.add_argument("text")
+    typing.add_argument("--unicode-input", choices=("auto", "Keymap", "CtrlShiftU"), default="auto",
+                        help="host-background only: auto uses CtrlShiftU for known Chromium/Electron app IDs")
     key = commands.add_parser("key"); key.add_argument("session"); key.add_argument("keys", nargs="+")
     return parser
 
@@ -648,28 +677,36 @@ def parser():
 def main():
     arguments = sys.argv[1:]
     app_argv = None
-    if arguments and arguments[0] in ("run", "exec") and "--" in arguments:
+    if arguments and arguments[0] in ("run", "launch", "exec") and "--" in arguments:
         split = arguments.index("--")
         app_argv = arguments[split + 1:]
         arguments = arguments[:split]
     cli = parser()
     args = cli.parse_args(arguments)
-    if args.command in ("run", "exec"):
+    if args.command in ("run", "launch", "exec"):
         if app_argv is None:
-            cli.error("run and exec require -- before the application command")
+            cli.error("run, launch and exec require -- before the application command")
         args.argv = app_argv
     try:
         if args.command == "doctor":
-            report = dependencies(); emit(report); return 0 if report["ready"] else 1
+            if args.backend == "host-background":
+                import host_background
+                report = host_background.doctor()
+            else:
+                report = dependencies()
+            emit(report); return 0 if report["ready"] else 1
         if args.command == "start":
             emit(start(args)); return 0
+        if args.command == "stop-host":
+            import host_background
+            emit(host_background.stop_current(sys.modules[__name__])); return 0
         if args.command == "exec" and (not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 3600):
             raise GuiError("--timeout must be within 0..3600 seconds")
         result = operate(args)
         emit(result)
         if args.command == "exec" and result["returncode"]:
             return 1
-        if args.command == "run" and result["returncode"] not in (None, 0):
+        if args.command in ("run", "launch") and result["returncode"] not in (None, 0):
             return 1
         if args.command == "stop" and result["status"] != "stopped":
             return 1

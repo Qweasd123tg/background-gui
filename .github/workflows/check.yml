@@ -24,5 +24,9 @@ jobs:
         run: |
           python scripts/bgui.py --help
           python scripts/build_observer_niri.py --help
+      - name: Check host IPC and backend lifecycle
+        run: python -m unittest discover -s tests -v
+      - name: Check session launcher syntax
+        run: bash -n examples/niri-agent-session
       - name: Check whitespace
         run: git show --check --oneline HEAD

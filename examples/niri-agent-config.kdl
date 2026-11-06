@@ -1,0 +1,3 @@
+// The regular configuration declares the Agent workspace once.
+include "config.kdl"
+include "niri-configs/host-background.kdl"

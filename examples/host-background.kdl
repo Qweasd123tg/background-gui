@@ -1,0 +1,24 @@
+// Optional HOST configuration for the patched niri from niri-computer-use.
+// Reuse the Agent workspace declaration from background-gui.kdl, or declare it once.
+// kitty --class bgui-agent uses this app ID; configure other apps explicitly.
+window-rule {
+    match app-id=r#"^bgui-agent$"#
+    open-on-workspace "Agent"
+    open-focused false
+}
+
+// Supported only by the host AgentInput patch. Its cursor is drawn by niri itself.
+window-rule {
+    match is-agent-driven=true
+    border {
+        on
+        width 2
+        active-color "#a78bfa"
+        inactive-color "#a78bfa"
+    }
+}
+
+// Replace the absolute path before including this optional binding.
+// binds {
+//     Mod+Shift+Escape { spawn "python3" "/absolute/background-gui/scripts/bgui.py" "stop-host"; }
+// }

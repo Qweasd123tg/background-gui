@@ -39,7 +39,7 @@ STALE_SECONDS = 3.0
 IMAGE_CORNER_RADIUS = 14.0
 FPS_OPTIONS = (1, 2, 5, 10, 15)
 MAX_THUMBNAILS = 64
-DEFAULT_SETTINGS = {"fps": 5, "fit_mode": "fit", "cursor": False,
+DEFAULT_SETTINGS = {"fps": 5, "fit_mode": "fit", "cursor": True,
                     "thumbnail_size": "normal", "rounding": 14}
 OLD_SESSION_MESSAGE = "Для просмотра отдельных окон нужен новый сеанс"
 

@@ -1,9 +1,26 @@
 ---
 name: background-gui
-description: Run and visually test native Linux GUI applications in a private background Wayland session, with a live viewer on the Agent workspace, without stealing the user's niri focus or input. Use for native application screenshots and UI interaction when a separate application instance can be launched. Prefer connected browser tools for web tasks.
+description: Run and visually test native Linux GUI applications in a private Wayland display with a live observer, or through window-addressed input on a patched host niri without changing system focus. Use for application screenshots and background UI interaction with a visible agent cursor. Prefer connected browser tools for web tasks.
 ---
 
 # Background GUI
+
+Keep `isolated` as the default. When the user wants real native windows on another
+workspace, read [references/host-background.md](references/host-background.md)
+and use the explicit `host-background` backend only after its doctor reports
+ready. The host needs the upstream AgentInput patch; the private observer build
+does not provide it. Use the same helper commands, but note the mode differences:
+
+- In host-background, `focus` selects an input target without moving real focus;
+  pointer coordinates come directly from the last saved **window** screenshot.
+- Let the user switch to the target workspace to see the compositor's agent cursor.
+  `watch` does not open an isolated observer for native windows.
+- Stop with `stop SESSION` or `stop-host`; native apps remain running.
+  Do not fall back to global input when the patch or target is unavailable.
+- Use separate app processes/profiles and one host attachment per compositor.
+  Use isolated sessions for concurrent independent tasks.
+
+The instructions below describe **isolated sessions**.
 
 Use the bundled helper to give this task its own display: headless Weston → nested niri → application. Show its windows through the shared observer on the user's `Agent` workspace. Each session has separate Wayland, niri IPC, D-Bus and clipboard state. This is display/input isolation, **not a filesystem or network sandbox**.
 

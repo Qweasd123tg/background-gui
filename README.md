@@ -1,6 +1,22 @@
 # Background GUI
 
-Run a native Linux application for an AI agent while you keep using your desktop. Each task gets a private Wayland display with its own input, niri IPC, D-Bus session and clipboard:
+Run a native Linux application for an AI agent while you keep using your desktop.
+
+| Mode | Where the agent works | Where you see its cursor |
+| --- | --- | --- |
+| `isolated` (default) | A private Weston → niri display | In the shared observer window; cursor is enabled for new viewer settings |
+| `host-background` (experimental) | A real window on your patched host niri, including another workspace | In that native window, drawn by the compositor's agent-input patch |
+
+The native mode needs the **running host compositor** from [niri-computer-use](https://github.com/lihaoze123/niri-computer-use). It does not start Weston or nested niri. Read [host setup and commands](references/host-background.md) before using it:
+
+```bash
+python3 <repo>/scripts/bgui.py doctor --backend host-background
+python3 <repo>/scripts/bgui.py start --backend host-background --window WINDOW_ID
+```
+
+The native adapter has protocol/lifecycle tests and a GTK smoke check in a nested patched niri on Fedora 44. That check verified background clicks, Unicode text, preserved focus, the visible agent cursor and detach behavior. Main-session and hardware behavior still need verification after logging into a patched niri session. See the optional [systemd/GDM session examples](references/host-background.md#separate-systemdgdm-session) for a separate login entry. `stop-host` is a hotkey target for detaching the active native attachment.
+
+The rest of this guide describes `isolated`. Each task gets a private Wayland display with its own input, niri IPC, D-Bus session and clipboard:
 
 ```text
 headless Weston → nested niri → separate application instance
@@ -113,7 +129,7 @@ Whole-output screenshots use the pointer coordinate origin. A window-only captur
 - Closing the observer hides it; registered applications keep running. A later `watch` reopens it.
 - `stop SESSION` stops only that session's owned processes and unregisters it. Other sessions and the shared observer survive. Stop is idempotent; logs and saved screenshots remain available.
 
-The menu persists refresh rate, cursor visibility, thumbnail size, rounding and Fit/1:1 settings. A dimmed frame with an age label means updates are unavailable, not that the application is current. UI labels are currently Russian.
+The menu persists refresh rate, cursor visibility, thumbnail size, rounding and Fit/1:1 settings. Cursor visibility defaults to on for new settings; an existing saved preference is respected. A dimmed frame with an age label means updates are unavailable, not that the application is current. UI labels are currently Russian.
 
 ## Limits and privacy
 

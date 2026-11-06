@@ -40,6 +40,11 @@ Protocol file SHA256:
 
 ## Runtime dependencies
 
+The optional host-background adapter implements the `AgentInput` / `AgentScreenshot`
+IPC contract developed by [lihaoze123/niri-computer-use](https://github.com/lihaoze123/niri-computer-use).
+Its compositor modifications are GPL-3.0-or-later and are installed separately.
+This repository does not redistribute that patch or a patched host binary.
+
 Weston, niri, wtype, D-Bus, Wayland, GTK, libadwaita, PyGObject and other system
 or build dependencies are separate upstream projects with their own licenses.
 They are not included in this source repository.
