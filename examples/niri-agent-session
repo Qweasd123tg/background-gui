@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 task_home="${HOME:?HOME is required}"
-task_install="${BGUI_NIRI_INSTALL_DIR:-$task_home/.local/lib/background-gui-host/niri-bd6e39f3}"
+task_install="${BGUI_NIRI_INSTALL_DIR:-$task_home/.local/lib/background-gui-host/current}"
 task_binary="$task_install/bin/niri"
 task_config="${BGUI_NIRI_CONFIG:-${XDG_CONFIG_HOME:-$task_home/.config}/niri/agent-input.kdl}"
 task_unit="${BGUI_NIRI_SYSTEMD_UNIT:-niri-agent.service}"

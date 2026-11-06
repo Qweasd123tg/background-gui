@@ -349,6 +349,9 @@ def stop_owned(path, state):
 
 
 def start(args):
+    if args.backend == "host-desktop":
+        import host_desktop
+        return host_desktop.start(args, sys.modules[__name__])
     if args.backend == "host-background":
         import host_background
         return host_background.start(args, sys.modules[__name__])
@@ -558,9 +561,12 @@ def launch_command(args, path, state, env):
 def operate(args):
     if args.command == "stop":
         path = session_dir(args.session)
-        if read_state(path).get("backend") == "host-background":
+        if read_state(path).get("backend") in ("host-background", "host-desktop"):
             (path / "stop.requested").touch(mode=0o600)
     with locked_session(args.session) as (path, state):
+        if state.get("backend") == "host-desktop":
+            import host_desktop
+            return host_desktop.operate(args, path, state, sys.modules[__name__])
         if state.get("backend") == "host-background":
             import host_background
             return host_background.operate(args, path, state, sys.modules[__name__])
@@ -634,13 +640,13 @@ def parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     doctor = commands.add_parser("doctor", help="Check backend prerequisites")
-    doctor.add_argument("--backend", choices=("isolated", "host-background"), default="isolated")
+    doctor.add_argument("--backend", choices=("isolated", "host-background", "host-desktop"), default="isolated")
     commands.add_parser("stop-host", help="Detach the current host compositor's background agent (hotkey target)")
     start_p = commands.add_parser("start", help="Create an isolated display or attach to patched host niri")
     start_p.add_argument("--width", type=int, default=1280)
     start_p.add_argument("--height", type=int, default=800)
     start_p.add_argument("--name", help="Human-readable project or task label")
-    start_p.add_argument("--backend", choices=("isolated", "host-background"), default="isolated")
+    start_p.add_argument("--backend", choices=("isolated", "host-background", "host-desktop"), default="isolated")
     start_p.add_argument("--window", type=int, help="Existing host window ID for host-background")
     for name in ("run", "launch", "exec"):
         sub = commands.add_parser(name, help="Launch argv in the selected session" + (" and wait" if name == "exec" else ""))
@@ -654,12 +660,16 @@ def parser():
     rename.add_argument("session"); rename.add_argument("name")
     focus = commands.add_parser("focus"); focus.add_argument("session"); focus.add_argument("window", type=int)
     screenshot = commands.add_parser("screenshot")
-    screenshot.add_argument("session"); screenshot.add_argument("--window", type=int); screenshot.add_argument("--path")
+    screenshot.add_argument("session")
+    screenshot.add_argument("--window", type=int)
+    screenshot.add_argument("--path")
+    screenshot.add_argument("--output", help="Monitor name for host-desktop capture")
+    screenshot.add_argument("--show-pointer", action="store_true", help="Include desktop cursors")
     for name in ("move", "click"):
         sub = commands.add_parser(name); sub.add_argument("session"); sub.add_argument("x", type=int); sub.add_argument("y", type=int)
         if name == "click":
             sub.add_argument("--button", choices=("left", "right", "middle"), default="left")
-    drag = commands.add_parser("drag", help="Drag inside the host-background target")
+    drag = commands.add_parser("drag", help="Drag within the selected native client")
     drag.add_argument("session")
     for coordinate in ("x", "y", "end_x", "end_y"):
         drag.add_argument(coordinate, type=int)
@@ -689,7 +699,10 @@ def main():
         args.argv = app_argv
     try:
         if args.command == "doctor":
-            if args.backend == "host-background":
+            if args.backend == "host-desktop":
+                import host_desktop
+                report = host_desktop.doctor()
+            elif args.backend == "host-background":
                 import host_background
                 report = host_background.doctor()
             else:

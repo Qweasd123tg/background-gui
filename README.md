@@ -5,6 +5,7 @@ Run a native Linux application for an AI agent while you keep using your desktop
 | Mode | Where the agent works | Where you see its cursor |
 | --- | --- | --- |
 | `isolated` (default) | A private Weston → niri display | In the shared observer window; cursor is enabled for new viewer settings |
+| `host-desktop` (experimental) | The visible native desktop, routing to windows, popups and layer-shell panels under the agent pointer | Across the desktop above windows; requires the additional [AgentDesktop patch](references/host-desktop.md) |
 | `host-background` (experimental) | A real window on your patched host niri, including another workspace | In that native window, drawn by the compositor's agent-input patch |
 
 The native mode needs the **running host compositor** from [niri-computer-use](https://github.com/lihaoze123/niri-computer-use). It does not start Weston or nested niri. Read [host setup and commands](references/host-background.md) before using it:

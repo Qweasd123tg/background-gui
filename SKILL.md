@@ -1,6 +1,6 @@
 ---
 name: background-gui
-description: Run and visually test native Linux GUI applications in a private Wayland display with a live observer, or through window-addressed input on a patched host niri without changing system focus. Use for application screenshots and background UI interaction with a visible agent cursor. Prefer connected browser tools for web tasks.
+description: Run and visually test native Linux GUI applications in a private Wayland display with a live observer, or through window-addressed input on a patched host niri without changing system focus. Use for application screenshots and background UI interaction with a visible agent cursor, including desktop-wide routing on the AgentDesktop extension. Prefer connected browser tools for web tasks.
 ---
 
 # Background GUI
@@ -19,6 +19,17 @@ does not provide it. Use the same helper commands, but note the mode differences
   Do not fall back to global input when the patch or target is unavailable.
 - Use separate app processes/profiles and one host attachment per compositor.
   Use isolated sessions for concurrent independent tasks.
+
+When the user wants a second visible mouse across the native desktop, read
+[host-desktop.md](references/host-desktop.md) and use the explicit `host-desktop`
+backend after its own doctor reports ready. It requires the additional bundled
+compositor patch. Capture the selected monitor with `--output`, inspect the saved
+image, and use its pixel coordinates; click selects the agent keyboard target.
+No observer or test application is required on the native host. The compositor
+refuses client input while the real pointer or keyboard is using that same
+Wayland client. Detach with `stop SESSION` or `stop-host`; never restart the host
+compositor to recover an attachment. Keep scoped host environment values in the
+helper, and resolve a stale caller socket against the running session before use.
 
 The instructions below describe **isolated sessions**.
 

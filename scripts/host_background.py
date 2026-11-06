@@ -17,6 +17,7 @@ import re
 import socket
 import stat
 import struct
+import subprocess
 import tempfile
 import time
 import uuid
@@ -121,12 +122,50 @@ class NiriIPC:
             raise HostError("Unexpected niri capability probe result")
 
 
+def refresh_login_environment(environment):
+    """Recover a caller retained across logout, using only a verified active niri service.
+
+    Never import/export the manager environment or copy unrelated secret variables.
+    Private session environments are rejected by host_endpoint before this runs.
+    """
+    endpoint = Path(environment.get("NIRI_SOCKET", ""))
+    if not endpoint.is_absolute() or endpoint.exists():
+        return environment, None
+    result = subprocess.run(["systemctl", "--user", "show-environment"],
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        raise HostError("Stale compositor socket and user manager is unavailable")
+    allowed = {"NIRI_SOCKET", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"}
+    selected = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in allowed:
+            selected[key] = value
+    if (not selected.get("NIRI_SOCKET") or
+        selected.get("XDG_RUNTIME_DIR") != environment.get("XDG_RUNTIME_DIR")):
+        raise HostError("Stale compositor socket; no matching host login in the user manager")
+    result = subprocess.run(["systemctl", "--user", "show", "niri-agent.service", "niri.service",
+                             "--property=MainPID", "--value"],
+                            capture_output=True, text=True, timeout=5)
+    pids = {int(line) for line in result.stdout.splitlines() if line.isdigit() and int(line) > 0}
+    if result.returncode or not pids:
+        raise HostError("Stale compositor socket; no active managed niri service")
+    return environment | selected, pids
+
+
 def host_endpoint():
     if os.environ.get("CODEX_BACKGROUND_GUI_SESSION") or os.environ.get("WAYLAND_SOCKET"):
         raise HostError("Run host-background from the normal host shell, outside a private session")
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
-    display = os.environ.get("WAYLAND_DISPLAY")
-    endpoint = Path(os.environ.get("NIRI_SOCKET", ""))
+    original_runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+    if original_runtime.name.startswith("cbg-"):
+        raise HostError("Expected the user's host runtime directory")
+    try:
+        environment, expected_pids = refresh_login_environment(dict(os.environ))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HostError("Could not resolve the current managed niri login") from exc
+    runtime = Path(environment.get("XDG_RUNTIME_DIR", ""))
+    display = environment.get("WAYLAND_DISPLAY")
+    endpoint = Path(environment.get("NIRI_SOCKET", ""))
     if not runtime.is_absolute() or not endpoint.is_absolute() or not display:
         raise HostError("Host XDG_RUNTIME_DIR, WAYLAND_DISPLAY and an absolute NIRI_SOCKET are required")
     runtime = runtime.resolve()
@@ -140,9 +179,13 @@ def host_endpoint():
         raise HostError("Host Wayland and niri sockets must belong to the host runtime directory")
     socket_identity(wayland)
     client = NiriIPC(endpoint)
+    if expected_pids is not None:
+        client.windows()  # Also validates peer credentials, identity and PID after reconnect.
+        if client.peer[0] not in expected_pids:
+            raise HostError("Recovered IPC socket does not belong to the active niri service")
     return client, {"XDG_RUNTIME_DIR": str(runtime), "WAYLAND_DISPLAY": str(wayland),
                     "NIRI_SOCKET": str(endpoint),
-                    "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")}
+                    "DBUS_SESSION_BUS_ADDRESS": environment.get("DBUS_SESSION_BUS_ADDRESS", "")}
 
 
 def doctor():
@@ -184,11 +227,11 @@ def compositor_lock(core, identity):
         yield lease
 
 
-def start(args, core):
+def start(args, core, backend=BACKEND, probe=None):
     if args.window is not None and not 0 < args.window < 2**64:
         raise HostError("--window must be a positive uint64 from doctor --backend host-background")
     client, env = host_endpoint()
-    client.probe()
+    (probe or (lambda c: c.probe()))(client)
     window = target(client, args.window, for_input=True) if args.window is not None else None
     name = core.session_name(args.name) if args.name is not None else (window or {}).get("title")
     with compositor_lock(core, client.identity) as lease:
@@ -201,14 +244,14 @@ def start(args, core):
         session = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:10]
         path = core.private_dir(core.root_dir() / "sessions" / session)
         core.private_dir(path / "screenshots")
-        state = {"id": session, "backend": BACKEND, "name": name, "status": "running",
+        state = {"id": session, "backend": backend, "name": name, "status": "running",
                  "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "processes": [],
                  "host_env": env, "socket_identity": client.identity, "peer_identity": client.peer,
                  "target": pin(window) if window else None}
         core.write_state(path, state)
         lease.write_text(json.dumps({"session": session}))
         lease.chmod(0o600)
-    return {"session": session, "backend": BACKEND, "status": "running", "name": name,
+    return {"session": session, "backend": backend, "status": "running", "name": name,
             "window": window, "session_dir": str(path), "agent_cursor": "compositor overlay"}
 
 

@@ -1,0 +1,750 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index c41f5fc..a34aa6b 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -131,6 +131,23 @@ pub enum Request {
+         /// Events to deliver, in order.
+         events: Vec<AgentEvent>,
+     },
++    /// Move an independent visible pointer across the desktop. Motion coordinates are global
++    /// logical pixels. Click selects the agent keyboard target without activating real focus.
++    AgentDesktopInput {
++        /// Events delivered in order; Motion uses global logical coordinates.
++        events: Vec<AgentEvent>,
++    },
++    /// Hide the desktop pointer and release the agent's pressed buttons and keys.
++    AgentDesktopStop,
++    /// Capture one named monitor without clipboard or notification side effects.
++    AgentDesktopScreenshot {
++        /// Name of the monitor, as returned by Outputs.
++        output: String,
++        /// Absolute path of the PNG file to write.
++        path: String,
++        /// Include both the real and agent pointers.
++        show_pointer: bool,
++    },
+     /// Screenshot one window to a PNG file with no side effects.
+     ///
+     /// Unlike the `ScreenshotWindow` action, this neither shows a notification nor replaces the
+@@ -174,6 +191,22 @@ pub struct AgentScreenshotInfo {
+     pub geometry_y: i32,
+ }
+ 
++/// Monitor image coordinates map to global logical coordinates as `(pixel / scale) + logical_*`.
++#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct AgentDesktopScreenshotInfo {
++    /// Width in physical pixels, after applying the output transform.
++    pub width: u32,
++    /// Height in physical pixels, after applying the output transform.
++    pub height: u32,
++    /// Physical pixels per logical pixel.
++    pub scale: f64,
++    /// Global logical X origin of this monitor.
++    pub logical_x: i32,
++    /// Global logical Y origin of this monitor.
++    pub logical_y: i32,
++}
++
+ /// Event for [`Request::AgentInput`].
+ #[derive(Debug, Serialize, Deserialize, Clone)]
+ #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+@@ -255,6 +288,8 @@ pub enum Response {
+     Handled,
+     /// Result of [`Request::AgentScreenshot`].
+     AgentScreenshot(AgentScreenshotInfo),
++    /// Result of a desktop monitor capture.
++    AgentDesktopScreenshot(AgentDesktopScreenshotInfo),
+     /// The version string for the running niri instance.
+     Version(String),
+     /// Information about connected outputs.
+diff --git a/src/agent_input.rs b/src/agent_input.rs
+index 58d736f..2f85ece 100644
+--- a/src/agent_input.rs
++++ b/src/agent_input.rs
+@@ -13,6 +13,8 @@
+ //! agent pointer drives it, and re-enters afterwards). What the user types or drags in the client
+ //! meanwhile mixes with the agent's input.
+ 
++mod desktop;
++
+ use niri_ipc::{AgentActivityKind, AgentEvent, AgentScreenshotInfo, AgentUnicodeInput};
+ use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, WindowSurfaceType};
+ use smithay::input::keyboard::{xkb, KeymapFile, Keycode};
+@@ -75,6 +77,7 @@ pub struct AgentInputState {
+     /// Agent pointer indicators by window id, shown while the window is agent-driven.
+     cursors: HashMap<u64, AgentCursor>,
+     expiry_running: bool,
++    desktop: Option<desktop::DesktopState>,
+ }
+ 
+ #[derive(Debug)]
+@@ -383,6 +386,9 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
+ 
+ impl State {
+     pub fn agent_input(&mut self, window_id: u64, events: Vec<AgentEvent>) -> Result<(), String> {
++        if self.niri.agent_input.desktop.is_some() {
++            return Err("desktop agent is attached; stop it before window input".into());
++        }
+         let (window, toplevel) = self
+             .niri
+             .layout
+@@ -1241,6 +1247,9 @@ impl Niri {
+                 redraw.extend(output.cloned());
+             }
+         });
++        if self.agent_input.desktop.as_ref().is_some_and(|d| d.cursor.is_animating(now)) {
++            self.queue_redraw_all();
++        }
+         for output in redraw {
+             self.queue_redraw(&output);
+         }
+diff --git a/src/agent_input/desktop.rs b/src/agent_input/desktop.rs
+new file mode 100644
+index 0000000..c73eb7e
+--- /dev/null
++++ b/src/agent_input/desktop.rs
+@@ -0,0 +1,530 @@
++//! Desktop-wide virtual pointer. Real seat coordinates and focus are never changed.
++use super::*;
++use niri_ipc::AgentDesktopScreenshotInfo;
++use smithay::output::Output;
++
++const DESKTOP_IDLE: Duration = Duration::from_secs(120);
++
++#[derive(Debug)]
++pub(super) struct DesktopState {
++    pub(super) cursor: AgentCursor,
++    touched: Instant,
++    // The last hit, retained during an implicit button grab.
++    hover: Option<(WlSurface, Point<f64, Logical>, WlSurface, Option<u64>)>,
++    // Clicking, rather than hovering, selects where agent keys go.
++    target: Option<WlSurface>,
++}
++
++impl State {
++    fn agent_desktop_busy(&self, client: &Client) -> bool {
++        self.niri
++            .seat
++            .get_keyboard()
++            .unwrap()
++            .current_focus()
++            .is_some_and(|s| same_client(&s, client))
++            || self
++                .niri
++                .seat
++                .get_pointer()
++                .unwrap()
++                .current_focus()
++                .is_some_and(|s| same_client(&s, client))
++    }
++
++    fn desktop_leave_pointer(&mut self) {
++        let pointer = self.niri.seat.get_pointer().unwrap();
++        if let Some(surface) = self.niri.agent_input.pointer.take() {
++            if let Some(client) = surface.client() {
++                // A real enter supersedes our stream. Never leave the user's real surface.
++                if !pointer
++                    .current_focus()
++                    .is_some_and(|s| same_client(&s, &client))
++                {
++                    for ptr in pointer.client_pointers(&client) {
++                        for button in &self.niri.agent_input.buttons.clone() {
++                            ptr.button(
++                                self.niri.agent_input.next_serial(),
++                                now_ms(),
++                                *button,
++                                ButtonState::Released,
++                            );
++                        }
++                        if surface.is_alive() {
++                            ptr.leave(self.niri.agent_input.next_serial(), &surface);
++                        }
++                        if ptr.version() >= 5 {
++                            ptr.frame();
++                        }
++                    }
++                }
++            }
++        }
++        self.niri.agent_input.buttons.clear();
++    }
++
++    fn desktop_leave_keyboard(&mut self) {
++        let keyboard = self.niri.seat.get_keyboard().unwrap();
++        if let Some((surface, keys)) = self.niri.agent_input.keyboard.take() {
++            if let Some(client) = surface.client() {
++                if !keyboard
++                    .current_focus()
++                    .is_some_and(|s| same_client(&s, &client))
++                {
++                    for kbd in keyboard.client_keyboards(&client) {
++                        for key in &keys {
++                            kbd.key(
++                                self.niri.agent_input.next_serial(),
++                                now_ms(),
++                                *key,
++                                KeyState::Released,
++                            );
++                        }
++                        if surface.is_alive() {
++                            kbd.leave(self.niri.agent_input.next_serial(), &surface);
++                        }
++                    }
++                }
++            }
++        }
++        self.niri.agent_input.keyboard_shared = false;
++        self.niri.agent_input.keyboard_stale = false;
++    }
++
++    pub fn agent_desktop_stop(&mut self) {
++        if self.niri.agent_input.desktop.take().is_none() {
++            return;
++        }
++        self.desktop_leave_pointer();
++        self.desktop_leave_keyboard();
++        self.niri.agent_input.pointer_hold = None;
++        self.niri.agent_input.cursors.clear();
++        self.niri.queue_redraw_all();
++        self.update_pointer_contents();
++    }
++
++    fn desktop_touch(&mut self, pos: Point<f64, Logical>) {
++        if let Some(d) = self.niri.agent_input.desktop.as_mut() {
++            d.touched = Instant::now();
++            return;
++        }
++        // Also clean up a previous window-addressed stream before attaching.
++        self.desktop_leave_pointer();
++        self.desktop_leave_keyboard();
++        self.niri.agent_input.cursors.clear();
++        let now = Instant::now();
++        self.niri.agent_input.desktop = Some(DesktopState {
++            cursor: AgentCursor::new(pos, now),
++            touched: now,
++            hover: None,
++            target: None,
++        });
++        // A crashed helper must not leave a pressed modifier or mouse button forever.
++        if let Err(err) =
++            self.niri
++                .event_loop
++                .insert_source(Timer::from_duration(DESKTOP_IDLE), |_, _, state| {
++                    let Some(d) = state.niri.agent_input.desktop.as_ref() else {
++                        return TimeoutAction::Drop;
++                    };
++                    let left = DESKTOP_IDLE.saturating_sub(d.touched.elapsed());
++                    if left.is_zero() {
++                        state.agent_desktop_stop();
++                        TimeoutAction::Drop
++                    } else {
++                        TimeoutAction::ToDuration(left)
++                    }
++                })
++        {
++            warn!("error scheduling desktop agent expiry: {err}");
++        }
++    }
++
++    fn desktop_motion(&mut self, pos: Point<f64, Logical>) -> Result<(), String> {
++        if !pos.x.is_finite() || !pos.y.is_finite() || self.niri.output_under(pos).is_none() {
++            return Err("desktop coordinates must be finite and inside a monitor".into());
++        }
++        self.desktop_touch(pos);
++        self.niri
++            .agent_input
++            .desktop
++            .as_mut()
++            .unwrap()
++            .cursor
++            .move_to(pos, Instant::now());
++        self.niri.queue_redraw_all();
++        let hit = if self.niri.agent_input.buttons.is_empty() {
++            let under = self.niri.contents_under_for_agent(pos);
++            under.surface.and_then(|(surface, origin)| {
++                let root = under
++                    .window
++                    .as_ref()
++                    .and_then(|(w, _)| w.toplevel())
++                    .map(|t| t.wl_surface().clone())
++                    .or_else(|| under.layer.as_ref().map(|l| l.wl_surface().clone()))?;
++                let id = under.window.and_then(|(w, _)| {
++                    self.niri
++                        .layout
++                        .windows()
++                        .find(|(_, m)| m.window == w)
++                        .map(|(_, m)| m.id().get())
++                });
++                Some((surface, origin, root, id))
++            })
++        } else {
++            self.niri
++                .agent_input
++                .desktop
++                .as_ref()
++                .unwrap()
++                .hover
++                .clone()
++        };
++        let hit = hit.filter(|(s, _, _, _)| {
++            s.is_alive() && s.client().is_some_and(|c| !self.agent_desktop_busy(&c))
++        });
++        let Some((surface, origin, root, id)) = hit else {
++            self.desktop_leave_pointer();
++            self.niri.agent_input.desktop.as_mut().unwrap().hover = None;
++            return Ok(()); // The cursor is still visible over empty space or a busy client.
++        };
++        let client = surface.client().ok_or("desktop surface closed")?;
++        let pointer = self.niri.seat.get_pointer().unwrap();
++        let old = self.niri.agent_input.pointer.clone();
++        let reenter = old.as_ref() != Some(&surface)
++            || self.niri.agent_input.pointer_real_enter != pointer.last_enter();
++        if reenter {
++            self.desktop_leave_pointer();
++        }
++        self.agent_hold_pointer(&client);
++        self.niri
++            .agent_input
++            .clients
++            .insert(client.id(), Instant::now());
++        let local = pos - origin;
++        for ptr in pointer.client_pointers(&client) {
++            if reenter {
++                ptr.enter(
++                    self.niri.agent_input.next_serial(),
++                    &surface,
++                    local.x,
++                    local.y,
++                );
++            }
++            ptr.motion(now_ms(), local.x, local.y);
++            if ptr.version() >= 5 {
++                ptr.frame();
++            }
++        }
++        self.niri.agent_input.pointer = Some(surface.clone());
++        self.niri.agent_input.pointer_real_enter = pointer.last_enter();
++        self.niri.agent_input.desktop.as_mut().unwrap().hover = Some((surface, origin, root, id));
++        if let Some(id) = id {
++            self.agent_mark_window(id);
++            self.agent_pump_window(id);
++        }
++        Ok(())
++    }
++
++    pub fn agent_desktop_input(&mut self, events: Vec<AgentEvent>) -> Result<(), String> {
++        if self.niri.is_locked() {
++            self.agent_desktop_stop();
++            return Err("desktop agent is unavailable while the session is locked".into());
++        }
++        // Reject malformed batches before delivering any event.
++        for event in &events {
++            match event {
++                AgentEvent::Motion { x, y }
++                    if !x.is_finite()
++                        || !y.is_finite()
++                        || self.niri.output_under(Point::from((*x, *y))).is_none() =>
++                {
++                    return Err("desktop coordinates must be finite and inside a monitor".into())
++                }
++                AgentEvent::Axis {
++                    vertical,
++                    horizontal,
++                } if !vertical.is_finite() || !horizontal.is_finite() => {
++                    return Err("scroll amounts must be finite".into())
++                }
++                _ => (),
++            }
++        }
++        if let Some(d) = self.niri.agent_input.desktop.as_mut() {
++            d.touched = Instant::now();
++        }
++        for event in events {
++            if let AgentEvent::Motion { x, y } = event {
++                self.desktop_motion(Point::from((x, y)))?;
++                continue;
++            }
++            let d = self
++                .niri
++                .agent_input
++                .desktop
++                .as_mut()
++                .ok_or("Motion required before desktop input")?;
++            d.touched = Instant::now();
++            match event {
++                AgentEvent::Button { button, pressed } => {
++                    let pos = self.niri.agent_input.desktop.as_ref().unwrap().cursor.to;
++                    self.desktop_motion(pos)?; // Re-hit-test after a window/popup moved.
++                    let (surface, _, root, _) = self
++                        .niri
++                        .agent_input
++                        .desktop
++                        .as_ref()
++                        .unwrap()
++                        .hover
++                        .clone()
++                        .ok_or("no input surface here, or the user is using this client")?;
++                    let client = surface.client().ok_or("desktop surface closed")?;
++                    if self.agent_desktop_busy(&client) {
++                        return Err("user is using this client".into());
++                    }
++                    if pressed {
++                        if self
++                            .niri
++                            .agent_input
++                            .desktop
++                            .as_ref()
++                            .unwrap()
++                            .target
++                            .as_ref()
++                            != Some(&root)
++                        {
++                            self.desktop_leave_keyboard();
++                            self.niri.agent_input.desktop.as_mut().unwrap().target =
++                                Some(root.clone());
++                        }
++                        if !self.niri.agent_input.is_popup(&surface) {
++                            for popup in self.niri.agent_input.take_popups(&root) {
++                                let _ = PopupManager::dismiss_popup(&root, &popup);
++                            }
++                        }
++                    }
++                    self.niri.agent_input.buttons.retain(|b| *b != button);
++                    if pressed {
++                        self.niri.agent_input.buttons.push(button);
++                    }
++                    let pointer = self.niri.seat.get_pointer().unwrap();
++                    for ptr in pointer.client_pointers(&client) {
++                        ptr.button(
++                            self.niri.agent_input.next_serial(),
++                            now_ms(),
++                            button,
++                            if pressed {
++                                ButtonState::Pressed
++                            } else {
++                                ButtonState::Released
++                            },
++                        );
++                        if ptr.version() >= 5 {
++                            ptr.frame();
++                        }
++                    }
++                    self.niri
++                        .agent_input
++                        .desktop
++                        .as_mut()
++                        .unwrap()
++                        .cursor
++                        .set_pressed(pressed, Instant::now());
++                    self.agent_hold_pointer(&client);
++                }
++                AgentEvent::Axis {
++                    vertical,
++                    horizontal,
++                } => {
++                    let pos = self.niri.agent_input.desktop.as_ref().unwrap().cursor.to;
++                    self.desktop_motion(pos)?;
++                    let (surface, _, _, _) = self
++                        .niri
++                        .agent_input
++                        .desktop
++                        .as_ref()
++                        .unwrap()
++                        .hover
++                        .as_ref()
++                        .ok_or("no input surface here, or the user is using this client")?;
++                    let client = surface.client().ok_or("desktop surface closed")?;
++                    let pointer = self.niri.seat.get_pointer().unwrap();
++                    for ptr in pointer.client_pointers(&client) {
++                        if vertical != 0. {
++                            ptr.axis(now_ms(), Axis::VerticalScroll, vertical);
++                        }
++                        if horizontal != 0. {
++                            ptr.axis(now_ms(), Axis::HorizontalScroll, horizontal);
++                        }
++                        if ptr.version() >= 5 {
++                            ptr.frame();
++                        }
++                    }
++                }
++                AgentEvent::Key { .. } | AgentEvent::Text { .. } => {
++                    let root = self
++                        .niri
++                        .agent_input
++                        .desktop
++                        .as_ref()
++                        .unwrap()
++                        .target
++                        .clone()
++                        .filter(|s| s.is_alive())
++                        .ok_or("click a surface before typing")?;
++                    let client = root.client().ok_or("desktop keyboard target closed")?;
++                    if self.agent_desktop_busy(&client) {
++                        return Err("user is using the agent keyboard client".into());
++                    }
++                    self.niri
++                        .agent_input
++                        .clients
++                        .insert(client.id(), Instant::now());
++                    self.restore_configured_keymap();
++                    self.agent_send_seat_keymap(&client);
++                    match event {
++                        AgentEvent::Key { keycode, pressed } => {
++                            self.agent_key(&client, &root, keycode, pressed)
++                        }
++                        AgentEvent::Text {
++                            text,
++                            unicode_input,
++                        } => self.agent_text(&client, &root, &text, unicode_input)?,
++                        _ => unreachable!(),
++                    }
++                }
++                AgentEvent::PointerLeave => {
++                    self.desktop_leave_pointer();
++                }
++                AgentEvent::KeyboardLeave => {
++                    self.desktop_leave_keyboard();
++                }
++                AgentEvent::Motion { .. } => unreachable!(),
++            }
++        }
++        self.niri.queue_redraw_all();
++        Ok(())
++    }
++
++    pub fn agent_desktop_screenshot(
++        &mut self,
++        name: String,
++        path: String,
++        show_pointer: bool,
++        done: async_channel::Sender<Result<AgentDesktopScreenshotInfo, String>>,
++    ) -> Result<(), String> {
++        if self.niri.is_locked() {
++            return Err("desktop capture is unavailable while the session is locked".into());
++        }
++        let output = self
++            .niri
++            .global_space
++            .outputs()
++            .find(|o| o.name() == name)
++            .cloned()
++            .ok_or_else(|| format!("no output named {name}"))?;
++        let origin = self.niri.global_space.output_geometry(&output).unwrap().loc;
++        let scale = output.current_scale().fractional_scale();
++        let niri = &mut self.niri;
++        let (size, pixels) = self
++            .backend
++            .with_primary_renderer(|renderer| {
++                niri.render_output_pixels(renderer, &output, show_pointer)
++            })
++            .ok_or("no renderer")?
++            .map_err(|err| format!("error rendering desktop: {err:?}"))?;
++        std::thread::spawn(move || {
++            let result = (|| {
++                let mut buf = Vec::new();
++                crate::utils::write_png_rgba8(
++                    std::io::Cursor::new(&mut buf),
++                    size.w as u32,
++                    size.h as u32,
++                    &pixels,
++                )
++                .map_err(|err| format!("error encoding PNG: {err:?}"))?;
++                std::fs::write(&path, buf).map_err(|err| format!("error writing {path}: {err}"))?;
++                Ok(AgentDesktopScreenshotInfo {
++                    width: size.w as u32,
++                    height: size.h as u32,
++                    scale,
++                    logical_x: origin.x,
++                    logical_y: origin.y,
++                })
++            })();
++            let _ = done.send_blocking(result);
++        });
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::tests::fixture::Fixture;
++
++    #[test]
++    fn desktop_motion_crosses_outputs_without_moving_real_seat() {
++        let mut f = Fixture::new();
++        f.add_output(1, (1920, 1080));
++        f.add_output(2, (1280, 720));
++        let pointer = f.niri().seat.get_pointer().unwrap();
++        let keyboard = f.niri().seat.get_keyboard().unwrap();
++        let before = (pointer.current_location(), keyboard.current_focus());
++        for n in [1, 2] {
++            let output = f.niri_output(n);
++            let geo = f.niri().global_space.output_geometry(&output).unwrap();
++            let pos = geo.loc.to_f64() + Point::from((100., 100.));
++            f.niri_state()
++                .agent_desktop_input(vec![AgentEvent::Motion { x: pos.x, y: pos.y }])
++                .unwrap();
++            assert_eq!(
++                f.niri().agent_input.desktop.as_ref().unwrap().cursor.to,
++                pos
++            );
++        }
++        assert_eq!(
++            (pointer.current_location(), keyboard.current_focus()),
++            before
++        );
++        f.niri_state().agent_desktop_stop();
++        assert!(f.niri().agent_input.desktop.is_none());
++        assert!(f.niri().agent_input.pointer.is_none());
++        assert!(f.niri().agent_input.keyboard.is_none());
++        assert!(f.niri().agent_input.buttons.is_empty());
++    }
++
++    #[test]
++    fn desktop_rejects_invalid_batches_before_attaching() {
++        let mut f = Fixture::new();
++        f.add_output(1, (1920, 1080));
++        for (x, y) in [(f64::NAN, 1.), (1., f64::INFINITY), (-2000., 0.)] {
++            let result = f.niri_state().agent_desktop_input(vec![
++                AgentEvent::Motion { x: 100., y: 100. },
++                AgentEvent::Motion { x, y },
++            ]);
++            assert!(result.is_err());
++            assert!(f.niri().agent_input.desktop.is_none());
++        }
++    }
++}
++
++impl Niri {
++    pub fn render_agent_desktop(&self, output: &Output, push: &mut dyn FnMut(BorderRenderElement)) {
++        let Some(d) = self.agent_input.desktop.as_ref() else {
++            return;
++        };
++        let origin = self
++            .global_space
++            .output_geometry(output)
++            .unwrap()
++            .loc
++            .to_f64();
++        // The renderer clips each output. This also lets the cursor straddle monitor edges.
++        d.cursor.render(
++            origin.upscale(-1.),
++            output.current_scale().fractional_scale() as f32,
++            push,
++        );
++    }
++}
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 5e1337e..bd2f7a4 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -456,6 +456,36 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+             let casts = state.casts.casts.values().cloned().collect();
+             Response::Casts(casts)
+         }
++        Request::AgentDesktopInput { events } => {
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                let _ = tx.send_blocking(state.agent_desktop_input(events));
++            });
++            rx.recv().await.map_err(|_| "error delivering desktop input".to_string())??;
++            Response::Handled
++        }
++        Request::AgentDesktopStop => {
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                state.agent_desktop_stop();
++                let _ = tx.send_blocking(());
++            });
++            rx.recv().await.map_err(|_| "error stopping desktop input".to_string())?;
++            Response::Handled
++        }
++        Request::AgentDesktopScreenshot { output, path, show_pointer } => {
++            if !Path::new(&path).is_absolute() {
++                return Err("path must be absolute".to_string());
++            }
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                if let Err(err) = state.agent_desktop_screenshot(output, path, show_pointer, tx.clone()) {
++                    let _ = tx.send_blocking(Err(err));
++                }
++            });
++            let info = rx.recv().await.map_err(|_| "error taking desktop screenshot".to_string())??;
++            Response::AgentDesktopScreenshot(info)
++        }
+         Request::AgentInput { window_id, events } => {
+             let (tx, rx) = async_channel::bounded(1);
+             ctx.event_loop.insert_idle(move |state| {
+diff --git a/src/niri.rs b/src/niri.rs
+index 46f0236..723a6d1 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -3560,6 +3560,14 @@ impl Niri {
+     ///
+     /// This function does not take pointer or touch grabs into account.
+     pub fn contents_under(&self, pos: Point<f64, Logical>) -> PointContents {
++        self.contents_under_impl(pos, false)
++    }
++
++    pub fn contents_under_for_agent(&self, pos: Point<f64, Logical>) -> PointContents {
++        self.contents_under_impl(pos, true)
++    }
++
++    fn contents_under_impl(&self, pos: Point<f64, Logical>, agent: bool) -> PointContents {
+         let mut rv = PointContents::default();
+ 
+         let Some((output, pos_within_output)) = self.output_under(pos) else {
+@@ -3733,7 +3741,7 @@ impl Niri {
+ 
+         // A computer-use agent pointer is driving this client: the real pointer must not focus
+         // its surfaces meanwhile (see AgentInputState::pointer_hold).
+-        if surface_and_pos
++        if !agent && surface_and_pos
+             .as_ref()
+             .and_then(|(surface, _)| surface.client())
+             .is_some_and(|client| self.agent_input.holds_pointer(&client.id()))
+@@ -4502,6 +4510,11 @@ impl Niri {
+             push
+         };
+ 
++        // A desktop agent cursor belongs to the output, not to any individual tile.
++        if include_pointer && !self.is_locked() {
++            self.render_agent_desktop(output, &mut |elem| push(elem.into()));
++        }
++
+         // The pointer goes on the top.
+         if include_pointer && self.pointer_visibility.is_visible() {
+             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+@@ -6266,6 +6279,23 @@ impl Niri {
+             .context("error saving screenshot")
+     }
+ 
++    /// Side-effect-free monitor capture used by the independent desktop agent.
++    pub fn render_output_pixels(
++        &mut self,
++        renderer: &mut GlesRenderer,
++        output: &Output,
++        show_pointer: bool,
++    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
++        self.update_render_elements(Some(output));
++        let size = output.current_transform().transform_size(output.current_mode().unwrap().size);
++        let scale = Scale::from(output.current_scale().fractional_scale());
++        let ctx = RenderCtx { renderer, target: RenderTarget::ScreenCapture, xray: None };
++        let elements = self.render_to_vec(ctx, output, show_pointer);
++        let pixels = render_to_vec(renderer, size, scale, Transform::Normal, Fourcc::Abgr8888,
++            elements.iter().rev())?;
++        Ok((size, pixels))
++    }
++
+     pub fn screenshot_window(
+         &self,
+         renderer: &mut GlesRenderer,
+@@ -7290,6 +7320,7 @@ niri_render_elements! {
+             SolidColorRenderElement
+         >>>,
+         Pointer = PointerRenderElements<R>,
++        AgentCursor = crate::render_helpers::border::BorderRenderElement,
+         Wayland = WaylandSurfaceRenderElement<R>,
+         SolidColor = SolidColorRenderElement,
+         ScreenshotUi = ScreenshotUiRenderElement,

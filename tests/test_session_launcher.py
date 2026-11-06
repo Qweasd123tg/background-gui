@@ -73,6 +73,15 @@ esac
         self.assertIn("systemctl --user --wait start niri-agent.service", commands)
         self.assertIn("niri-shutdown.target", commands)
 
+    def test_default_installation_uses_current_version_symlink(self):
+        self.env.pop("BGUI_NIRI_INSTALL_DIR")
+        current = self.root / ".local/lib/background-gui-host/current"
+        current.parent.mkdir(parents=True)
+        current.symlink_to(self.install, target_is_directory=True)
+        result, commands = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--wait start niri-agent.service", commands)
+
     def test_actual_start_failure_is_reported(self):
         self.env["BGUI_TEST_START_STATUS"] = "9"
         result, commands = self.run_launcher()

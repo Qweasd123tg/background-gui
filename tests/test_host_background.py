@@ -176,6 +176,26 @@ class HostBackgroundTests(unittest.TestCase):
     def action(self, *arguments):
         return bgui.operate(bgui.parser().parse_args([arguments[0], self.session, *arguments[1:]]))
 
+    def test_stale_login_socket_recovers_only_matching_managed_peer(self):
+        stale = self.runtime / "niri.old.sock"
+        manager = (f"XDG_RUNTIME_DIR={self.runtime}\nWAYLAND_DISPLAY=wayland-0\n"
+                   f"NIRI_SOCKET={self.fake.path}\nDBUS_SESSION_BUS_ADDRESS=unix:path=test\n"
+                   "PRIVATE_TEST_SECRET=must-not-be-copied\n")
+        pid = 1234 if self.fake.server is None else os.getpid()
+        replies = [subprocess.CompletedProcess([], 0, manager, ""),
+                   subprocess.CompletedProcess([], 0, f"{pid}\n0\n", "")]
+        with mock.patch.dict(os.environ, NIRI_SOCKET=str(stale)), mock.patch.object(host.subprocess, "run", side_effect=replies):
+            client, env = host.host_endpoint()
+        self.assertEqual(client.path, str(self.fake.path))
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "unix:path=test")
+        self.assertNotIn("PRIVATE_TEST_SECRET", env)
+        self.assertNotIn("PRIVATE_TEST_SECRET", os.environ)
+        replies = [subprocess.CompletedProcess([], 0, manager, ""),
+                   subprocess.CompletedProcess([], 0, "999999999\n0\n", "")]
+        with mock.patch.dict(os.environ, NIRI_SOCKET=str(stale)), mock.patch.object(host.subprocess, "run", side_effect=replies):
+            with self.assertRaisesRegex(host.HostError, "active niri service"):
+                host.host_endpoint()
+
     def test_full_window_input_and_detach_contract(self):
         self.assertTrue(host.doctor()["ready"])
         self.start()

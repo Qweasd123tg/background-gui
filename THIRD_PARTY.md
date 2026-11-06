@@ -43,7 +43,12 @@ Protocol file SHA256:
 The optional host-background adapter implements the `AgentInput` / `AgentScreenshot`
 IPC contract developed by [lihaoze123/niri-computer-use](https://github.com/lihaoze123/niri-computer-use).
 Its compositor modifications are GPL-3.0-or-later and are installed separately.
-This repository does not redistribute that patch or a patched host binary.
+This repository does not redistribute the upstream AgentInput patch or a patched
+host binary. `assets/niri-agent-desktop.patch` is an incremental GPL-3.0-or-later
+extension to that pinned integration and retains context from the niri and
+AgentInput sources. Its input, rendering and IPC code builds on work by the niri,
+Smithay and niri-computer-use contributors. Exact source pins and application
+order are documented in `references/host-desktop.md`.
 
 Weston, niri, wtype, D-Bus, Wayland, GTK, libadwaita, PyGObject and other system
 or build dependencies are separate upstream projects with their own licenses.

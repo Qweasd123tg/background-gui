@@ -37,8 +37,9 @@ The optional [launcher](../examples/niri-agent-session),
 entry for testing. Review the destination files before copying these examples.
 
 The default layout expects the patched executable at
-`~/.local/lib/background-gui-host/niri-bd6e39f3/bin/niri` and its config at
-`~/.config/niri/agent-input.kdl`. Install the launcher as
+`~/.local/lib/background-gui-host/current/bin/niri` and its config at
+`~/.config/niri/agent-input.kdl`. Make `current` a symlink to a versioned private
+installation directory, keeping the previous directory for rollback. Install the launcher as
 `~/.local/bin/niri-agent-session`, the service under `~/.config/systemd/user/`,
 and the config wrapper as `~/.config/niri/agent-input.kdl`. The wrapper includes
 your regular `config.kdl` plus `niri-configs/host-background.kdl`; the regular
@@ -81,6 +82,10 @@ journalctl -b -g 'gdm-wayland-session|niri-agent'
 Run the helper from your normal niri shell. It needs the current session's
 `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY` and `NIRI_SOCKET`. It uses Python's Unix
 socket client directly, so a stock `niri msg` executable on PATH is fine.
+When a caller survives logout and retains a missing old socket, the helper can
+recover the current scoped endpoint from the user manager, requiring the same
+runtime directory and an IPC peer PID belonging to the active niri service. It
+does not import the manager environment or copy unrelated variables.
 `doctor` probes the two new request variants using a nonexistent window ID;
 the probes do not send input to any window or create a screenshot.
 

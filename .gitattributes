@@ -1,3 +1,4 @@
 # Preserve upstream license formatting and unified-diff context lines verbatim.
 LICENSE -whitespace
 assets/niri-observer.patch -whitespace
+assets/niri-agent-desktop.patch -whitespace
