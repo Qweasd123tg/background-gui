@@ -412,6 +412,17 @@ def send(client, state, events):
         raise HostError("Unexpected AgentInput reply; input was not retried")
 
 
+def show_click(client, state, window_id, motion, bounds):
+    # Input has already succeeded. A closed window or failed marker never replays it.
+    marker = {"window_id": window_id, **motion, "color": state.get("color", 0), "pressed": True}
+    if bounds:
+        marker["bounds"] = bounds
+    try:
+        client.request({"AgentIndicateAction": marker})
+    except (HostError, OSError):
+        pass
+
+
 def shared_action(args, path, state, client):
     import bgui_widgets
     window = target(client, target_id(state), state["target"])
@@ -427,7 +438,10 @@ def shared_action(args, path, state, client):
         raise HostError("The user is focused on the target or sharing its pointer. "
                         "Click an accessible button or select an editable field before typing")
 
-    def authorize():
+    click_bounds = None
+
+    def authorize(bounds=None):
+        nonlocal click_bounds
         current = target(client, window["id"], state["target"])
         if (path / "stop.requested").exists() or current["title"] != window["title"]:
             raise HostError("Target changed or stop requested")
@@ -435,10 +449,10 @@ def shared_action(args, path, state, client):
             verify_inspected_image(path, state, client, args.seen)
         # Niri verifies the session is unlocked and the point is on the pinned
         # window. This request only paints feedback, even on older v2 builds.
-        reply = client.request({"AgentIndicateAction": {
-            "window_id": window["id"], "x": point[0], "y": point[1],
-            "pressed": command == "click", "color": state.get("color", 0)}})
-        if reply != "Handled":
+        click_bounds = bounds
+        marker = {"window_id": window["id"], "x": point[0], "y": point[1],
+                  "pressed": False, "color": state.get("color", 0)}
+        if client.request({"AgentIndicateAction": marker}) != "Handled":
             raise HostError("Unable to indicate the shared window target")
         return current
     if command == "move":
@@ -447,6 +461,8 @@ def shared_action(args, path, state, client):
     else:
         operation = bgui_widgets.operate_shared(state, window, point,
                                                 args.text if command == "type" else None, authorize)
+    if command == "click":
+        show_click(client, state, window["id"], {"x": point[0], "y": point[1]}, click_bounds)
     if command in ("move", "click"):
         state["pointer"] = [args.x, args.y]
     return {"session": state["id"], "backend": BACKEND, "window": window["id"],
@@ -493,10 +509,10 @@ def window_action(args, path, state, client, window):
         events = [position(state, window, args.x, args.y)]
         if command == "click":
             events.extend({"Button": {"button": BUTTONS[args.button], "pressed": p}} for p in (True, False))
-        remembered = None
+        remembered, bounds = None, None
         if command == "click" and args.button == "left" and state["host_env"].get("DBUS_SESSION_BUS_ADDRESS"):
             import bgui_widgets
-            remembered = bgui_widgets.remember_entry(state, window, events[0]["Motion"])
+            remembered, bounds = bgui_widgets.inspect_click(state, window, events[0]["Motion"])
         if command == "click" and getattr(args, "seen", None):
             verify_inspected_image(path, state, client, args.seen)
         if (path / "stop.requested").exists():
@@ -507,6 +523,8 @@ def window_action(args, path, state, client, window):
             state.pop("shared_entry", None)
             if remembered:
                 state["shared_entry"] = remembered
+            if bounds:
+                show_click(client, state, window["id"], events[0]["Motion"], bounds)
     elif command == "scroll":
         if not all(math.isfinite(v) and abs(v) <= 1000000 for v in (args.vertical, args.horizontal)):
             raise HostError("Scroll values must be finite and within +/-1000000 logical pixels")
@@ -643,6 +661,7 @@ def operate(args, path, state, core):
             env.pop(key, None)
         env.update(state["host_env"])
         env.update(NIRI_AGENT_LAUNCH="1", CODEX_BACKGROUND_GUI_SESSION=state["id"])
+        env.setdefault("GNOME_ACCESSIBILITY", "1")
         return core.launch_command(args, path, state, env)
     if args.command == "screenshot":
         return capture(args, path, state, client, core)

@@ -29,6 +29,7 @@ does not provide it. Use the same helper commands, but note the mode differences
   field. `type` then addresses the selected field independently of the user's
   field. If the application exposes no control at that point, report which
   action could not be delivered. v3 follows the desktop's Xcursor arrow shape.
+  On v4 the ordinary window click also outlines an accessible control for 1.2 seconds.
 
 When the user wants a second visible mouse across the native desktop, read
 [host-desktop.md](references/host-desktop.md) and use the explicit `host-desktop`

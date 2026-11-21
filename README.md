@@ -22,7 +22,9 @@ The native adapter has protocol/lifecycle tests and a GTK smoke check in a neste
 In a shared window, ordinary `click` and `type` address accessible buttons and
 editable fields while the user types in another field. The agent keeps its own
 insertion position. v3 draws the agent arrow using the desktop's Xcursor theme,
-size and hotspot, with a distinct fill color for each agent.
+size and hotspot, with a distinct fill color for each agent. On v4 a window-targeted
+left click briefly outlines the clicked button, link or field in that same color
+when the application reports its bounds.
 
 To work in the *same window* while the user types, the experimental
 `scripts/bgui_widgets.py inspect --window ID` lists named actions exposed by the

@@ -140,10 +140,17 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
     if args.parallel_windows:
         from native_parallel_check import check_parallel
         def type_as_user(text):
-            subprocess.run(["wtype", "--", text], env=client_env, check=True, timeout=5)
-            layout = json.loads(subprocess.check_output(
-                [str(args.binary), "msg", "--json", "keyboard-layouts"], env=client_env, timeout=5))
-            assert layout["current_idx"] == 1, layout
+            subprocess.run(["wtype", "--", text], env=client_env, check=True, timeout=15)
+            # Disconnecting the virtual keyboard restores the configured layout
+            # asynchronously. Never retype the string while waiting for the change.
+            for _ in range(30):
+                layout = json.loads(subprocess.check_output(
+                    [str(args.binary), "msg", "--json", "keyboard-layouts"], env=client_env, timeout=5))
+                if layout["current_idx"] == 1:
+                    break
+                time.sleep(.05)
+            else:
+                raise AssertionError(layout)
         def focus_as_user(window_id):
             subprocess.run([str(args.binary), "msg", "action", "focus-window", "--id", str(window_id)],
                            env=client_env, check=True, timeout=5)
@@ -182,7 +189,43 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
         assert cli("type", first, " Я")["shared_action"] == "insert"
         assert click_control("entry")["shared_action"] == "select-entry"
         assert cli("type", first, " ✓")["shared_action"] == "insert"
-        assert click_control("button")["shared_action"] == "invoke"
+        version = json.loads(subprocess.check_output([str(args.binary), "msg", "--json", "version"],
+                                                     env=client_env, timeout=5))
+        if version["compositor"].endswith("-v4"):
+            from concurrent.futures import ThreadPoolExecutor
+            from threading import Event
+            from native_parallel_check import check_click_outline
+            sys.path.insert(0, str(project / "scripts"))
+            from host_background import NiriIPC
+            bounds = json.loads((args.artifacts/"left.bounds.json").read_text())["button"]
+            def capture_edges(filename):
+                # Read the nested compositor directly so CLI startup cannot miss
+                # the short effect. These requests neither move nor click a pointer.
+                path = args.artifacts / filename
+                ipc = NiriIPC(client_env["NIRI_SOCKET"])
+                frame = ipc.request({"AgentScreenshot": {"window_id": wid, "path": str(path),
+                                     "show_pointer": True}})["AgentScreenshot"]
+                return check_click_outline(dict(frame, path=path), bounds, (145, 92, 255))
+            started = Event()
+            def observe_press():
+                started.set()
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    edges = capture_edges("outline-on.png")
+                    if min(edges) >= 12: return edges
+                    time.sleep(.06)
+                raise AssertionError(("button outline missing", edges, bounds))
+            with ThreadPoolExecutor(max_workers=1) as sampler:
+                pending = sampler.submit(observe_press)
+                started.wait(timeout=2)
+                assert click_control("button")["shared_action"] == "invoke"
+                visible = pending.result()
+            time.sleep(1.3)
+            expired = capture_edges("outline-off.png")
+            assert max(expired) == 0, expired
+            result["click_outline"] = {"visible": visible, "expired": expired}
+        else:
+            assert click_control("button")["shared_action"] == "invoke"
         type_as_user("after")
         for _ in range(40):
             received = json.loads((args.artifacts / "left.shared.json").read_text())
@@ -193,9 +236,7 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
         assert next(w["id"] for w in cli("windows", first) if w["is_focused"]) == wid
         result["shared_window"] = received
         cli("screenshot", first, "--show-pointer", "--path", str(args.artifacts / "shared-after.png"))
-        version = json.loads(subprocess.check_output([str(args.binary), "msg", "--json", "version"],
-                                                     env=client_env, timeout=5))
-        if version["compositor"].endswith("-v3"):
+        if version["compositor"].endswith(("-v3", "-v4")):
             # Leave the arrow over a flat patch so the renderer can be compared
             # against the original Xcursor mask independently of the text caret.
             x, y = frame["width"]*3//4, frame["height"]*9//10

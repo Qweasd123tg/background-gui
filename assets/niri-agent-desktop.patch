@@ -1,8 +1,8 @@
 diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
-index c41f5fc..c0edb83 100644
+index c41f5fc..e468276 100644
 --- a/niri-ipc/src/lib.rs
 +++ b/niri-ipc/src/lib.rs
-@@ -131,6 +131,47 @@ pub enum Request {
+@@ -131,6 +131,50 @@ pub enum Request {
          /// Events to deliver, in order.
          events: Vec<AgentEvent>,
      },
@@ -35,6 +35,9 @@ index c41f5fc..c0edb83 100644
 +        /// Show a click ring unless the caller requested only pointer motion.
 +        #[serde(default)]
 +        pressed: Option<bool>,
++        /// Clicked control bounds (x, y, width, height), in window-local logical pixels.
++        #[serde(default)]
++        bounds: Option<[f64; 4]>,
 +    },
 +    /// Hide the desktop pointer and release the agent's pressed buttons and keys.
 +    AgentDesktopStop,
@@ -50,7 +53,7 @@ index c41f5fc..c0edb83 100644
      /// Screenshot one window to a PNG file with no side effects.
      ///
      /// Unlike the `ScreenshotWindow` action, this neither shows a notification nor replaces the
-@@ -174,6 +215,22 @@ pub struct AgentScreenshotInfo {
+@@ -174,6 +218,22 @@ pub struct AgentScreenshotInfo {
      pub geometry_y: i32,
  }
  
@@ -73,7 +76,7 @@ index c41f5fc..c0edb83 100644
  /// Event for [`Request::AgentInput`].
  #[derive(Debug, Serialize, Deserialize, Clone)]
  #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-@@ -255,6 +312,8 @@ pub enum Response {
+@@ -255,6 +315,8 @@ pub enum Response {
      Handled,
      /// Result of [`Request::AgentScreenshot`].
      AgentScreenshot(AgentScreenshotInfo),
@@ -83,7 +86,7 @@ index c41f5fc..c0edb83 100644
      Version(String),
      /// Information about connected outputs.
 diff --git a/src/agent_input.rs b/src/agent_input.rs
-index 58d736f..06eb143 100644
+index 58d736f..9c03c67 100644
 --- a/src/agent_input.rs
 +++ b/src/agent_input.rs
 @@ -13,6 +13,9 @@
@@ -104,7 +107,7 @@ index 58d736f..06eb143 100644
  }
  
  #[derive(Debug)]
-@@ -108,14 +112,9 @@ const AGENT_SHOT_MAX_WAIT: Duration = Duration::from_millis(500);
+@@ -108,14 +112,10 @@ const AGENT_SHOT_MAX_WAIT: Duration = Duration::from_millis(500);
  /// Agent pointer indicator animations.
  const CURSOR_APPEAR: Duration = Duration::from_millis(160);
  const CURSOR_GLIDE: Duration = Duration::from_millis(180);
@@ -114,6 +117,7 @@ index 58d736f..06eb143 100644
 -const CURSOR_FROM: [u8; 3] = [0x81, 0x8c, 0xf8];
 -const CURSOR_TO: [u8; 3] = [0xc0, 0x84, 0xfc];
 +const CURSOR_RIPPLE: Duration = Duration::from_millis(850);
++const CONTROL_OUTLINE: Duration = Duration::from_millis(1200);
  
 -/// The agent's pointer as drawn on its window: a gradient dot with a white outline and a soft
 -/// halo. It glides to new positions, and a ring ripples out when a button is pressed.
@@ -121,31 +125,45 @@ index 58d736f..06eb143 100644
  #[derive(Debug, Clone, Copy, PartialEq)]
  pub struct AgentCursor {
      shown_at: Instant,
-@@ -124,6 +123,7 @@ pub struct AgentCursor {
+@@ -124,7 +124,9 @@ pub struct AgentCursor {
      to: Point<f64, Logical>,
      moved_at: Instant,
      pressed: bool,
 +    color: u8,
      ripple: Option<(Point<f64, Logical>, Instant)>,
++    outline: Option<(Rectangle<f64, Logical>, Instant)>,
  }
  
-@@ -147,6 +147,7 @@ impl AgentCursor {
+ fn ease_out_cubic(t: f64) -> f64 {
+@@ -147,7 +149,9 @@ impl AgentCursor {
              to: pos,
              moved_at: now,
              pressed: false,
 +            color: 0,
              ripple: None,
++            outline: None,
          }
      }
-@@ -164,6 +165,7 @@ impl AgentCursor {
+ 
+@@ -164,13 +168,16 @@ impl AgentCursor {
  
      fn set_pressed(&mut self, pressed: bool, now: Instant) {
          if pressed && !self.pressed {
 +            self.from = self.to; // Snap the arrow tip to the press, even mid-glide.
              self.ripple = Some((self.to, now));
++            self.outline = None;
          }
          self.pressed = pressed;
-@@ -185,7 +187,6 @@ impl AgentCursor {
+     }
+ 
+     pub fn is_animating(&self, now: Instant) -> bool {
+-        progress(self.shown_at, now, CURSOR_APPEAR) < 1.
++        self.outline.is_some_and(|(_, at)| now.saturating_duration_since(at) < CONTROL_OUTLINE)
++            || progress(self.shown_at, now, CURSOR_APPEAR) < 1.
+             || progress(self.moved_at, now, CURSOR_GLIDE) < 1.
+             || self
+                 .ripple
+@@ -185,7 +192,6 @@ impl AgentCursor {
          push: &mut dyn FnMut(BorderRenderElement),
      ) {
          let now = Instant::now();
@@ -153,7 +171,7 @@ index 58d736f..06eb143 100644
  
          // A circle (or a ring when `width > 0`) centered at `center`.
          let circle = |center: Point<f64, Logical>,
-@@ -211,35 +212,18 @@ impl AgentCursor {
+@@ -211,35 +217,31 @@ impl AgentCursor {
              .with_location(origin + center - Point::from((diameter / 2., diameter / 2.)))
          };
  
@@ -184,17 +202,30 @@ index 58d736f..06eb143 100644
 +                push(circle(at, 16. + 48. * e, from, to, width, (1. - t * t) as f32));
              }
          }
++        if let Some((rect, started)) = self.outline {
++            let t = progress(started, now, CONTROL_OUTLINE);
++            if t < 1. {
++                let color = cursor_color(arrow::COLORS[usize::from(self.color) % arrow::COLORS.len()], 1.);
++                let size = rect.size;
++                let shape = Rectangle::from_size(size);
++                let alpha = ((1. - t) * 4.).min(1.) as f32;
++                push(BorderRenderElement::new(
++                    size, shape, GradientInterpolation::default(), color, color, 0.,
++                    shape, 2.5, CornerRadius::from(3.), scale, alpha,
++                ).with_location(origin + rect.loc));
++            }
++        }
++
  
 -        // The halo tightens while a button is held.
 -        let (halo, halo_alpha) = if self.pressed { (24., 0.3) } else { (34., 0.16) };
 -        let from = cursor_color(CURSOR_FROM, halo_alpha);
 -        let to = cursor_color(CURSOR_TO, halo_alpha);
 -        push(circle(center, halo * grow, from, to, 0., alpha));
-+
      }
  }
  
-@@ -381,8 +365,77 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
+@@ -381,8 +383,77 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
      surface.client().is_some_and(|c| c.id() == client.id())
  }
  
@@ -272,7 +303,7 @@ index 58d736f..06eb143 100644
          let (window, toplevel) = self
              .niri
              .layout
-@@ -455,7 +508,7 @@ impl State {
+@@ -455,7 +526,7 @@ impl State {
                      | AgentEvent::PointerLeave
              )
          });
@@ -281,7 +312,7 @@ index 58d736f..06eb143 100644
              // During a real pointer grab (the user dragging in the client) the real pointer stays
              // on the client; the agent's pointer events then mix with the user's.
              self.agent_hold_pointer(&client);
-@@ -615,7 +668,7 @@ impl State {
+@@ -615,7 +686,7 @@ impl State {
          // Let the window draw the result promptly even if it is off-screen.
          self.agent_pump_window(window_id);
  
@@ -290,7 +321,7 @@ index 58d736f..06eb143 100644
              // Extend the hold from the end of the input (and while a button is held).
              self.agent_hold_pointer(&client);
          }
-@@ -872,11 +925,12 @@ impl State {
+@@ -872,11 +943,12 @@ impl State {
                  // A keymap with one key per distinct character, sent to this client only. The
                  // client's modifiers are reset while it is active; the seat keymap is restored
                  // right after, before any real input can reach the client.
@@ -308,7 +339,7 @@ index 58d736f..06eb143 100644
                      self.agent_keyboard_enter(client, toplevel);
                      let keyboard = self.niri.seat.get_keyboard().unwrap();
                      for kbd in keyboard.client_keyboards(client) {
-@@ -888,7 +942,7 @@ impl State {
+@@ -888,7 +960,7 @@ impl State {
                          }
                          kbd.modifiers(self.niri.agent_input.next_serial(), 0, 0, 0, 0);
                      }
@@ -317,7 +348,7 @@ index 58d736f..06eb143 100644
                          // Wire keycode = xkb keycode - 8; the temp keymap starts at xkb 9.
                          let keycode = chunk.iter().position(|c| *c == ch).unwrap() as u32 + 1;
                          for kbd in keyboard.client_keyboards(client) {
-@@ -899,14 +953,6 @@ impl State {
+@@ -899,14 +971,6 @@ impl State {
                          }
                      }
                      self.agent_send_seat_keymap(client);
@@ -332,11 +363,11 @@ index 58d736f..06eb143 100644
                  }
                  Ok(())
              }
-@@ -1032,6 +1078,30 @@ impl State {
+@@ -1032,6 +1096,42 @@ impl State {
          true
      }
  
-+    pub fn agent_indicate_action(&mut self, window_id: u64, x: f64, y: f64, color: u8, pressed: bool) -> Result<(), String> {
++    pub fn agent_indicate_action(&mut self, window_id: u64, x: f64, y: f64, color: u8, pressed: bool, bounds: Option<[f64; 4]>) -> Result<(), String> {
 +        if self.niri.is_locked() {
 +            return Err("session locked".into());
 +        }
@@ -345,6 +376,17 @@ index 58d736f..06eb143 100644
 +        if !(0.0..f64::from(size.w)).contains(&x) || !(0.0..f64::from(size.h)).contains(&y) {
 +            return Err("marker outside window".into());
 +        }
++        let outline = bounds.and_then(|[left, top, width, height]| {
++            if !pressed || ![left, top, width, height].iter().all(|v| v.is_finite())
++                || width <= 0. || height <= 0. || !(left..left + width).contains(&x)
++                || !(top..top + height).contains(&y) {
++                return None;
++            }
++            let right = (left + width).min(f64::from(size.w));
++            let bottom = (top + height).min(f64::from(size.h));
++            let (left, top) = (left.max(0.), top.max(0.));
++            Some(Rectangle::new((left, top).into(), (right-left, bottom-top).into()))
++        });
 +        let now = Instant::now();
 +        let point = Point::from((x, y));
 +        let cursor = self.niri.agent_input.cursors.entry(window_id)
@@ -354,6 +396,7 @@ index 58d736f..06eb143 100644
 +        if pressed {
 +            cursor.set_pressed(true, now);
 +            cursor.set_pressed(false, now);
++            cursor.outline = outline.map(|rect| (rect, now));
 +        }
 +        self.agent_mark_window(window_id);
 +        self.niri.queue_redraw_all();
@@ -363,7 +406,7 @@ index 58d736f..06eb143 100644
      /// Mark a window as agent-driven for a while.
      fn agent_mark_window(&mut self, window_id: u64) {
          let state = &mut self.niri.agent_input;
-@@ -1187,6 +1257,17 @@ impl State {
+@@ -1187,6 +1287,17 @@ impl State {
                  warn!("error sending agent keymap: {err:?}");
              }
          }
@@ -381,7 +424,7 @@ index 58d736f..06eb143 100644
      }
  
      /// Send modifiers derived from the agent's own pressed keys (not the user's).
-@@ -1197,6 +1278,10 @@ impl State {
+@@ -1197,6 +1308,10 @@ impl State {
              // SAFETY: the temporary state is dropped before the lock is released.
              let keymap = unsafe { xkb.keymap() };
              let mut state = xkb::State::new(keymap);
@@ -392,7 +435,7 @@ index 58d736f..06eb143 100644
              for key in pressed {
                  state.update_key(Keycode::new(key + 8), xkb::KeyDirection::Down);
              }
-@@ -1241,6 +1326,9 @@ impl Niri {
+@@ -1241,6 +1356,9 @@ impl Niri {
                  redraw.extend(output.cloned());
              }
          });
@@ -402,7 +445,7 @@ index 58d736f..06eb143 100644
          for output in redraw {
              self.queue_redraw(&output);
          }
-@@ -1253,6 +1341,54 @@ mod tests {
+@@ -1253,6 +1371,54 @@ mod tests {
      use crate::tests::client::KeyboardEvent;
      use crate::tests::fixture::Fixture;
  
@@ -459,7 +502,7 @@ index 58d736f..06eb143 100644
          let mut f = Fixture::new();
 diff --git a/src/agent_input/arrow.rs b/src/agent_input/arrow.rs
 new file mode 100644
-index 0000000..cb5b601
+index 0000000..e78d8e2
 --- /dev/null
 +++ b/src/agent_input/arrow.rs
 @@ -0,0 +1,120 @@
@@ -478,7 +521,7 @@ index 0000000..cb5b601
 +use crate::cursor::{CursorManager, XCursor};
 +use crate::render_helpers::renderer::NiriRenderer;
 +
-+const COLORS: [[u8; 3]; 4] = [
++pub(super) const COLORS: [[u8; 3]; 4] = [
 +    [145, 92, 255],
 +    [20, 184, 176],
 +    [242, 89, 130],
@@ -1132,7 +1175,7 @@ index a856de9..3b277b3 100644
          self.size = size;
          self.named_cursor_cache.get_mut().clear();
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index 5e1337e..3da5439 100644
+index 5e1337e..f743f10 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
 @@ -456,6 +456,52 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
@@ -1155,10 +1198,10 @@ index 5e1337e..3da5439 100644
 +            rx.recv().await.map_err(|_| "could not deliver window action".to_string())??;
 +            Response::Handled
 +        }
-+        Request::AgentIndicateAction { window_id, x, y, color, pressed } => {
++        Request::AgentIndicateAction { window_id, x, y, color, pressed, bounds } => {
 +            let (tx, rx) = async_channel::bounded(1);
 +            ctx.event_loop.insert_idle(move |state| {
-+                let _ = tx.send_blocking(state.agent_indicate_action(window_id, x, y, color, pressed.unwrap_or(true)));
++                let _ = tx.send_blocking(state.agent_indicate_action(window_id, x, y, color, pressed.unwrap_or(true), bounds));
 +            });
 +            rx.recv().await.map_err(|_| "could not show widget action".to_string())??;
 +            Response::Handled

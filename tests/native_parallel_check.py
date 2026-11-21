@@ -1,6 +1,6 @@
 """Native fixture checks for native_desktop_supervisor.py --parallel-windows."""
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, BrokenBarrierError
 import json
 import time
 
@@ -59,7 +59,12 @@ def check_parallel(cli, artifacts, ready, type_as_user, focus_as_user):
         return dict(result, color=agent["color"], arrow_pixels=matched)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(exercise, ("left", "right")))
+        futures = [pool.submit(exercise, role) for role in ("left", "right")]
+        errors = [future.exception() for future in futures]
+        for error in errors:
+            if error and not isinstance(error, BrokenBarrierError):
+                raise error
+        results = [future.result() for future in futures]
     focus_as_user(user["id"])
     type_as_user("123")
     user_file = artifacts / "user.json"
@@ -74,3 +79,23 @@ def check_parallel(cli, artifacts, ready, type_as_user, focus_as_user):
     return {"agents": results, "focused_window": user["id"], "user_text": "user-123",
             "user_focus_sequence": [user["id"], alternate["id"], user["id"]], "alternate_text": actual,
             "keyboard_layout": "us,ru (second group)"}
+
+
+def check_click_outline(frame, bounds, expected_color):
+    from PIL import Image
+    scale = frame["scale"]
+    x, y, width, height = bounds
+    left, top = round(x*scale+frame["geometry_x"]), round(y*scale+frame["geometry_y"])
+    right, bottom = round(left+width*scale), round(top+height*scale)
+    band = round(4*scale)
+    with Image.open(frame["path"]) as source:
+        image = source.convert("RGB")
+        def colored(region):
+            crop = image.crop(region)
+            return sum(max(abs(c-v) for c, v in zip(pixel, expected_color)) < 24
+                       for pixel in crop.getdata())
+        return [colored(region) for region in [
+            (left+band,top-band,left+(right-left)//3,top+band),
+            (left+band,bottom-band,left+(right-left)//3,bottom+band),
+            (left-band,top+band,left+band,bottom-band),
+            (right-band,top+band,right+band,bottom-band)]]

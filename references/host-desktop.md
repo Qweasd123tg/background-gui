@@ -86,7 +86,7 @@ git -C /absolute/niri apply /absolute/background-gui/assets/niri-agent-desktop.p
 cd /absolute/niri
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v3
+export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v4
 cargo test --locked --release --lib -j 2 agent_input::
 cargo build --locked --release --bin niri -j 2
 ```

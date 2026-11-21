@@ -163,7 +163,7 @@ class HostBackgroundTests(unittest.TestCase):
         })
         self.env.start()
         # This simulated IPC server has no application accessibility tree.
-        self.transports.enter_context(mock.patch("bgui_widgets.remember_entry", return_value=None))
+        self.transports.enter_context(mock.patch("bgui_widgets.inspect_click", return_value=(None, None)))
 
     def tearDown(self):
         self.env.stop()
@@ -310,6 +310,30 @@ class HostBackgroundTests(unittest.TestCase):
             with self.assertRaisesRegex(host.HostError, "after button press"):
                 self.action("click", "48", "28")
             fallback.assert_not_called()
+
+    def test_outline_uses_pre_click_geometry_and_never_replays_input(self):
+        self.start()
+        self.action("screenshot")
+        bounds = [12, 7, 30, 14]
+        with mock.patch("bgui_widgets.inspect_click", return_value=(None, bounds)):
+            saved = bgui.read_state(bgui.session_dir(self.session))
+            saved["host_env"]["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=test"
+            bgui.write_state(bgui.session_dir(self.session), saved)
+            result = self.action("click", "48", "28")
+        self.assertEqual(result["action"], "click")
+        self.assertEqual(self.fake.requests[-1]["AgentIndicateAction"],
+                         {"window_id": 4, "x": 20, "y": 10, "color": 0, "pressed": True, "bounds": bounds})
+        self.assertEqual(sum("Button" in e and e["Button"]["pressed"] for e in self.fake.events), 1)
+        reply = self.fake.reply
+        def reject_feedback(request):
+            if isinstance(request, dict) and "AgentIndicateAction" in request:
+                return {"Err": "window closed"}
+            return reply(request)
+        self.fake.reply = reject_feedback
+        self.fake.events.clear()
+        with mock.patch("bgui_widgets.inspect_click", return_value=(None, bounds)):
+            self.assertEqual(self.action("click", "48", "28")["action"], "click")
+        self.assertEqual(sum("Button" in e and e["Button"]["pressed"] for e in self.fake.events), 1)
 
     def test_closed_or_reused_window_refused(self):
         self.start()

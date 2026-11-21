@@ -67,13 +67,15 @@ class Fixture(Gtk.Application):
             def record_geometry(*_):
                 if not entry.get_width() or not button.get_width():
                     return True
-                centers = {}
+                centers, rectangles = {}, {}
                 for name, widget in (("entry", entry), ("button", button)):
                     ok, bounds = widget.compute_bounds(window)
                     if not ok:
                         return True
+                    rectangles[name] = [bounds.get_x(), bounds.get_y(), bounds.get_width(), bounds.get_height()]
                     centers[name] = [bounds.get_x() + bounds.get_width() / 2,
                                      bounds.get_y() + bounds.get_height() / 2]
+                args.result.with_suffix(".bounds.json").write_text(json.dumps(rectangles))
                 args.result.with_suffix(".geometry.json").write_text(json.dumps(centers))
                 return False
             window.add_tick_callback(record_geometry)

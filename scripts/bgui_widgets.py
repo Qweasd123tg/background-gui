@@ -89,7 +89,7 @@ def accessibility(env):
         raise host.HostError("Application accessibility bus unavailable: " + str(exc)) from exc
 
 
-def shared_control(state, window, point):
+def shared_control(state, window, point, visual=False):
     """Hit-test this window's accessibility tree without changing the seat or widget focus."""
     Atspi, GLib = accessibility(state["host_env"])
     try:
@@ -125,19 +125,53 @@ def shared_control(state, window, point):
             node = node.get_parent()
         if chain[-1].path != root.path:
             raise ValueError("Hit does not belong to the pinned window")
+        # Firefox can return the entire frame while its hit-test cache warms up.
+        # Never click or outline that frame in place of its child.
+        controls = {Atspi.Role.LINK, Atspi.Role.PUSH_BUTTON, Atspi.Role.CHECK_BOX,
+                    Atspi.Role.RADIO_BUTTON, Atspi.Role.TOGGLE_BUTTON, Atspi.Role.PAGE_TAB,
+                    Atspi.Role.MENU_ITEM, Atspi.Role.COMBO_BOX}
+        if visual and hit_node.path == root.path:
+            import time
+            deadline = time.monotonic() + .35
+            def candidates(parent, depth):
+                if depth > 32 or time.monotonic() >= deadline:
+                    raise ValueError("Control bounds unavailable within the hit-test budget")
+                found = []
+                for child in children(parent):
+                    if child.app.bus_name != root.app.bus_name or child.path in visited:
+                        continue
+                    visited.add(child.path)
+                    if len(visited) > 400 or time.monotonic() >= deadline:
+                        raise ValueError("Control bounds unavailable within the hit-test budget")
+                    if not child.get_component_iface() or not control_bounds(child, Atspi, point):
+                        continue
+                    if child.get_role() in controls:
+                        found.append(child)
+                    else:
+                        found.extend(candidates(child, depth + 1))
+                    if len(found) > 1:
+                        raise ValueError("Overlapping accessible controls at the click position")
+                return found
+            visited = {root.path}
+            chain = candidates(root, 0)
         for node in chain:
+            role = node.get_role()
+            if node.path == root.path or role in (Atspi.Role.FRAME, Atspi.Role.DOCUMENT_WEB,
+                                                  Atspi.Role.INTERNAL_FRAME, Atspi.Role.SCROLL_PANE):
+                continue
             flags = node.get_state_set()
             if flags.contains(Atspi.StateType.DEFUNCT) or not flags.contains(Atspi.StateType.SENSITIVE):
                 raise ValueError("The shared control is unavailable")
-            role = node.get_role()
             if role == Atspi.Role.PASSWORD_TEXT:
                 raise ValueError("Use a separate window for password entry")
             token = [window["title"], root.app.bus_name, root.path, node.path, node.get_role_name(), node.get_name()]
             if flags.contains(Atspi.StateType.EDITABLE) and node.get_editable_text_iface():
                 return node, token, None, Atspi
+            if visual and role in controls:
+                return node, token, -1, Atspi  # Geometry only; never invoke this index.
             if node.get_action_iface():
                 for idx in range(node.get_n_actions()):
-                    if node.get_action_name(idx).lower() in ("click", "press", "activate", "toggle"):
+                    if node.get_action_name(idx).lower() in ("click", "press", "activate", "toggle", "jump"):
                         return node, token, idx, Atspi
         raise ValueError("No accessible button or editable field at the selected point")
     except (ValueError, GLib.Error) as exc:
@@ -155,21 +189,35 @@ def entry_selection(node, token, point, atspi):
     return {"token": token, "point": point, "offset": offset if 0 <= offset <= count else count}
 
 
-def remember_entry(state, window, motion):
-    # A later user focus change may occur between the agent's click and type.
-    # This lookup is read-only; apps without AT-SPI still get ordinary native clicks.
+def control_bounds(node, atspi, point=None):
+    from gi.repository import GLib
+    try:
+        box = node.get_extents(atspi.CoordType.WINDOW)
+    except GLib.Error:
+        return None
+    if box.width <= 0 or box.height <= 0:
+        return None
+    if point and not (box.x <= point[0] < box.x + box.width and box.y <= point[1] < box.y + box.height):
+        return None
+    return [box.x, box.y, box.width, box.height]
+
+
+def inspect_click(state, window, motion):
+    # Capture the original widget before a click changes the page or destroys it.
     point = [motion["x"], motion["y"]]
     try:
-        node, token, action, atspi = shared_control(state, window, point)
+        node, token, action, atspi = shared_control(state, window, point, visual=True)
+        bounds = control_bounds(node, atspi, point)
+        selection = None
         if action is None:
             from gi.repository import GLib
             try:
-                return dict(entry_selection(node, token, point, atspi), native=True)
+                selection = dict(entry_selection(node, token, point, atspi), native=True)
             except GLib.Error:
                 pass
+        return selection, bounds
     except host.HostError:
-        pass
-    return None
+        return None, None
 
 
 def operate_shared(state, window, point, text, authorize):
@@ -178,7 +226,7 @@ def operate_shared(state, window, point, text, authorize):
     from gi.repository import GLib
     try:
         if text is None and index is not None:
-            authorize()
+            authorize(control_bounds(node, atspi, point))
             if not node.do_action(index):
                 raise host.HostError("Application declined the shared control action")
             state.pop("shared_entry", None)
@@ -187,7 +235,7 @@ def operate_shared(state, window, point, text, authorize):
             raise host.HostError("The selected editable field changed")
         if text is None:
             selection = entry_selection(node, token, point, atspi)
-            authorize()
+            authorize(control_bounds(node, atspi, point))
             state["shared_entry"] = selection
             return "select-entry"
         count = node.get_character_count()
@@ -234,20 +282,15 @@ def main():
                     if current["title"] != win["title"] or root.get_name() != win["title"]:
                         raise ValueError("Window content changed during lookup")
                     # Capture bounds first; invoking may remove the widget or open a menu.
-                    center = None
-                    try:
-                        box = node.get_extents(Atspi.CoordType.WINDOW)
-                        if box.width > 0 and box.height > 0:
-                            center = (box.x + box.width / 2, box.y + box.height / 2)
-                    except GLib.Error:
-                        pass
+                    bounds = control_bounds(node, Atspi)
                     if not node.do_action(index):
                         raise ValueError("Application declined the action")
                     shown = False
-                    if center:
+                    if bounds:
+                        x, y, width, height = bounds
                         try:
                             shown = client.request({"AgentIndicateAction": {
-                                "window_id": args.window, "x": center[0], "y": center[1]}}) == "Handled"
+                                "window_id": args.window, "x": x + width/2, "y": y + height/2, "bounds": bounds}}) == "Handled"
                         except (OSError, host.HostError):
                             pass  # Action already accepted. Never replay for missing visual feedback.
                     result = {"window": args.window, "invoked": info, "indicator": shown}

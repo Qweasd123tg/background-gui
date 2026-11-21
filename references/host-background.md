@@ -132,7 +132,15 @@ attachment and the parallel window group are mutually exclusive. `stop SESSION`
 releases only that session; `stop-host` detaches the group. The v1 binary supports
 the existing exclusive modes only.
 
-A window screenshot with `--show-pointer` on v2 includes the agent arrow. For an
+v4 outlines an accessible button, link or field for 1.2 seconds on a left
+click. The helper reads the control bounds before dispatch, so a navigation can
+remove the control immediately after the click. Niri clips the outline to the
+clicked window and uses the agent's cursor color. When a widget provides no
+reliable bounds, ordinary input retains its point indicator. Firefox launched
+through the window helper receives `GNOME_ACCESSIBILITY=1` by default. An
+already-running browser can have a different accessibility configuration.
+
+A window screenshot with `--show-pointer` on v2 or later includes the agent arrow. For an
 action that depends on exactly what was visible, inspect a screenshot taken without
 cursors, then pass its exact path to the click:
 
