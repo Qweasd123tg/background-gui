@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -193,6 +194,7 @@ def doctor():
         client, _ = host_endpoint()
         client.probe()
         return {"ready": True, "backend": BACKEND, "windows": client.windows(),
+                "parallel_windows": parallel_supported(client),
                 "agent_cursor": "compositor overlay (visible when its window is visible)"}
     except (HostError, OSError) as exc:
         return {"ready": False, "backend": BACKEND, "error": str(exc)}
@@ -227,20 +229,54 @@ def compositor_lock(core, identity):
         yield lease
 
 
+PARALLEL_COLORS = ("violet", "teal", "pink", "blue")
+
+
+def save_lease(lease, value):
+    with tempfile.NamedTemporaryFile(mode="w", dir=lease.parent, delete=False) as f:
+        json.dump(value, f)
+    os.replace(f.name, lease)
+
+
+def parallel_supported(client):
+    try:
+        client.request({"AgentWindowBatch": {"window_id": PROBE_ID, "color": 0, "events": []}})
+    except ReplyError as exc:
+        return str(exc) == f"no window with id {PROBE_ID}"
+    return False
+
+
 def start(args, core, backend=BACKEND, probe=None):
     if args.window is not None and not 0 < args.window < 2**64:
         raise HostError("--window must be a positive uint64 from doctor --backend host-background")
     client, env = host_endpoint()
     (probe or (lambda c: c.probe()))(client)
+    parallel = getattr(args, "parallel", False)
+    if parallel and not parallel_supported(client):
+        raise HostError("Parallel window input requires a running AgentWindowBatch compositor (v2)")
     window = target(client, args.window, for_input=True) if args.window is not None else None
     name = core.session_name(args.name) if args.name is not None else (window or {}).get("title")
     with compositor_lock(core, client.identity) as lease:
+        agents = {}
         if lease.exists():
             previous = json.loads(lease.read_text())
-            previous_path = core.session_dir(previous["session"])
-            previous_state = core.read_state(previous_path)
-            if previous_state.get("status") == "running":
-                raise HostError(f"Host compositor already attached by {previous['session']}; stop it first")
+            ids = previous.get("windows", [previous["session"]])
+            for sid in ids:
+                previous_state = core.read_state(core.session_dir(sid))
+                if previous_state.get("status") != "running" or previous_state.get("peer_identity") != client.peer:
+                    continue
+                if not parallel or "color" not in previous_state:
+                    raise HostError(f"Host compositor already attached by {sid}; stop it first")
+                agents[sid] = previous_state
+        if parallel:
+            if not window or not window.get("pid"):
+                raise HostError("Parallel input needs a window with a known application PID")
+            if any(old["target"]["pid"] == window["pid"] for old in agents.values()):
+                raise HostError("Another agent owns this application process")
+            used = {old["color"] for old in agents.values()}
+            color = next((c for c in range(len(PARALLEL_COLORS)) if c not in used), None)
+            if color is None:
+                raise HostError("All four parallel window slots are in use")
         session = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:10]
         path = core.private_dir(core.root_dir() / "sessions" / session)
         core.private_dir(path / "screenshots")
@@ -248,11 +284,14 @@ def start(args, core, backend=BACKEND, probe=None):
                  "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "processes": [],
                  "host_env": env, "socket_identity": client.identity, "peer_identity": client.peer,
                  "target": pin(window) if window else None}
+        if parallel:
+            state["color"] = color
         core.write_state(path, state)
-        lease.write_text(json.dumps({"session": session}))
-        lease.chmod(0o600)
+        ids = [*agents, session]
+        save_lease(lease, {"session": ids[0], "windows": ids} if parallel else {"session": session})
     return {"session": session, "backend": backend, "status": "running", "name": name,
-            "window": window, "session_dir": str(path), "agent_cursor": "compositor overlay"}
+            "window": window, "session_dir": str(path), "agent_cursor": "compositor overlay",
+            **({"color": PARALLEL_COLORS[color]} if parallel else {})}
 
 
 def client_for(state):
@@ -278,8 +317,18 @@ def capture(args, path, state, client, core):
     image.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="capture-", dir=path / "screenshots") as temporary:
         pending = Path(temporary) / "frame.png"
-        response = client.request({"AgentScreenshot": {"window_id": window_id,
-                                  "path": str(pending), "show_pointer": False}})
+        # Marking an idle window as agent-driven can itself resize its border.
+        # Publish metadata only for a frame bracketed by matching window dimensions.
+        for attempt in range(3):
+            response = client.request({"AgentScreenshot": {"window_id": window_id,
+                                      "path": str(pending), "show_pointer": args.show_pointer}})
+            current = target(client, window_id, state["target"])
+            if ((window.get("layout") or {}).get("window_size") == (current.get("layout") or {}).get("window_size")
+                and current.get("title") == window.get("title")):
+                break
+            if attempt == 2:
+                raise HostError("Window changed during capture; take a fresh screenshot")
+            window = current
         info = response.get("AgentScreenshot") if isinstance(response, dict) else None
         if not isinstance(info, dict):
             raise HostError("Invalid AgentScreenshot metadata")
@@ -295,7 +344,8 @@ def capture(args, path, state, client, core):
                 output.write(pending.read_bytes())
         except FileExistsError as exc:
             raise HostError("Screenshot path already exists") from exc
-    state["capture"] = dict(info, window_id=window_id,
+    state["capture"] = dict(info, window_id=window_id, path=str(image), title=window.get("title"),
+                            sha256=hashlib.sha256(image.read_bytes()).hexdigest(), show_pointer=args.show_pointer,
                             window_size=(window.get("layout") or {}).get("window_size"))
     core.write_state(path, state)
     return {"session": state["id"], "backend": BACKEND, "path": str(image), "window": window_id,
@@ -315,6 +365,26 @@ def position(state, window, x, y):
     return {"Motion": {"x": x, "y": y}}
 
 
+def verify_inspected_image(path, state, client, seen):
+    capture = state["capture"]
+    if str(Path(seen).absolute()) != capture.get("path") or capture.get("show_pointer", True):
+        raise HostError("Use the last inspected window screenshot, captured without cursors")
+    if hashlib.sha256(Path(seen).read_bytes()).hexdigest() != capture.get("sha256"):
+        raise HostError("The inspected image file has changed")
+    with tempfile.TemporaryDirectory(prefix="verify-", dir=path / "screenshots") as directory:
+        pending = Path(directory) / "frame.png"
+        response = client.request({"AgentScreenshot": {"window_id": target_id(state),
+                                   "path": str(pending), "show_pointer": False}})
+        info = response.get("AgentScreenshot") if isinstance(response, dict) else None
+        if (not isinstance(info, dict) or any(info.get(k) != capture[k] for k in
+                ("scale", "geometry_x", "geometry_y", "width", "height"))
+            or hashlib.sha256(pending.read_bytes()).hexdigest() != capture.get("sha256")):
+            raise HostError("Window contents changed; inspect a new screenshot before clicking")
+    window = target(client, target_id(state), state["target"], for_input=True)
+    if window.get("title") != capture.get("title") or (path / "stop.requested").exists():
+        raise HostError("Window title changed or stop requested")
+
+
 def key_events(chords):
     events = []
     for chord in chords:
@@ -330,7 +400,12 @@ def key_events(chords):
 
 
 def send(client, state, events):
-    if client.request({"AgentInput": {"window_id": target_id(state), "events": events}}) != "Handled":
+    request = {"window_id": target_id(state), "events": events}
+    kind = "AgentInput"
+    if "color" in state:
+        kind = "AgentWindowBatch"
+        request["color"] = state["color"]
+    if client.request({kind: request}) != "Handled":
         raise HostError("Unexpected AgentInput reply; input was not retried")
 
 
@@ -342,6 +417,8 @@ def input_action(args, path, state, client):
     if command in ("move", "click"):
         events = [position(state, window, args.x, args.y)]
         if command == "click":
+            if getattr(args, "seen", None):
+                verify_inspected_image(path, state, client, args.seen)
             events.extend({"Button": {"button": BUTTONS[args.button], "pressed": p}} for p in (True, False))
         send(client, state, events)
     elif command == "scroll":
@@ -364,6 +441,8 @@ def input_action(args, path, state, client):
     elif command == "key":
         send(client, state, key_events(args.keys))
     elif command == "drag":
+        if "color" in state:
+            raise HostError("Timed drag needs an exclusive host-background attachment")
         if not math.isfinite(args.duration) or not .1 <= args.duration <= 2:
             raise HostError("Drag duration must be within 0.1..2 seconds")
         begin = position(state, window, args.x, args.y)
@@ -396,15 +475,22 @@ def stop(path, state, core):
     error = None
     if state["status"] == "running" and state.get("target"):
         try:
-            send(client_for(state), state, ["PointerLeave", "KeyboardLeave"])
+            send(client_for(state), state, [] if "color" in state else ["PointerLeave", "KeyboardLeave"])
         except (HostError, OSError) as exc:
             error = str(exc)
     state["status"] = "stopped"
     state["stopped_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     core.write_state(path, state)
     with compositor_lock(core, state["socket_identity"]) as lease:
-        if lease.exists() and json.loads(lease.read_text()).get("session") == state["id"]:
-            lease.unlink()
+        if lease.exists():
+            record = json.loads(lease.read_text())
+            ids = record.get("windows", [record["session"]])
+            if state["id"] in ids:
+                others = [sid for sid in ids if sid != state["id"]]
+                if others:
+                    save_lease(lease, {"session": others[0], "windows": others})
+                else:
+                    lease.unlink()
     # Host applications and the host compositor are never signaled by detach.
     return {"session": state["id"], "backend": BACKEND, "status": "stopped",
             "detached": True, "input_cleanup_error": error}
@@ -413,10 +499,17 @@ def stop(path, state, core):
 def stop_current(core):
     client, _ = host_endpoint()
     with compositor_lock(core, client.identity) as lease:
-        session = json.loads(lease.read_text())["session"] if lease.exists() else None
-    if session is None:
+        record = json.loads(lease.read_text()) if lease.exists() else None
+        ids = record.get("windows", [record["session"]]) if record else []
+        for sid in ids:
+            (core.session_dir(sid) / "stop.requested").touch(mode=0o600)
+    if not ids:
         return {"backend": BACKEND, "status": "stopped", "detached": True}
-    return core.operate(core.parser().parse_args(["stop", session]))
+    stopped = [core.operate(core.parser().parse_args(["stop", sid])) for sid in ids]
+    if len(stopped) == 1:
+        return stopped[0]
+    return {"backend": BACKEND, "status": "stopped", "sessions": stopped}
+
 
 
 def operate(args, path, state, core):
@@ -441,6 +534,8 @@ def operate(args, path, state, core):
     if args.command == "windows":
         return client.windows()
     if args.command == "focus":
+        if "color" in state and args.window != target_id(state):
+            raise HostError("Parallel sessions are pinned to their selected window")
         window = target(client, args.window, for_input=True)
         # In host-background this selects an input target; it does not focus the seat.
         state["target"] = pin(window)

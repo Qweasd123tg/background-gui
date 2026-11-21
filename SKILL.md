@@ -17,8 +17,12 @@ does not provide it. Use the same helper commands, but note the mode differences
   `watch` does not open an isolated observer for native windows.
 - Stop with `stop SESSION` or `stop-host`; native apps remain running.
   Do not fall back to global input when the patch or target is unavailable.
-- Use separate app processes/profiles and one host attachment per compositor.
-  Use isolated sessions for concurrent independent tasks.
+- On v2, two or more agents may use `start --backend host-background --parallel
+  --window ID` in different application processes. Each gets its own window and
+  color. Desktop-wide and ordinary host-background attachments remain exclusive.
+  Before clicking an observed publication/send control, use `click SESSION X Y
+  --seen /absolute/inspected-frame.png` in window mode; inspect the fresh image if
+  the check reports a change. Verify delivery before retrying.
 
 When the user wants a second visible mouse across the native desktop, read
 [host-desktop.md](references/host-desktop.md) and use the explicit `host-desktop`

@@ -6,7 +6,7 @@ from pathlib import Path
 import gi
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--role", choices=("left", "right", "user", "layer"), required=True)
+parser.add_argument("--role", choices=("left", "right", "user", "alternate", "layer"), required=True)
 parser.add_argument("--result", type=Path, required=True)
 args = parser.parse_args()
 gi.require_version("Gtk", "4.0")
@@ -24,7 +24,8 @@ class Fixture(Gtk.Application):
 
     def open_window(self, app):
         window = Gtk.ApplicationWindow(application=app, title="Desktop test · " + args.role)
-        window.set_default_size(520 if args.role != "user" else 280, 430 if args.role != "user" else 160)
+        user_window = args.role in ("user", "alternate")
+        window.set_default_size(280 if user_window else 520, 160 if user_window else 430)
         if args.role == "layer":
             Gtk4LayerShell.init_for_window(window)
             Gtk4LayerShell.set_namespace(window, "bgui-desktop-test-panel")
@@ -39,8 +40,14 @@ class Fixture(Gtk.Application):
         heading = Gtk.Label(label="Рабочий стол · " + args.role, xalign=0)
         heading.add_css_class("title-1")
         box.append(heading)
-        if args.role == "user":
-            box.append(Gtk.Entry(placeholder_text="Фокус пользователя остаётся здесь"))
+        if user_window:
+            entry = Gtk.Entry(placeholder_text="Фокус пользователя остаётся здесь")
+            box.append(entry)
+            def record_user_text(widget):
+                snapshot = args.result.with_suffix(".tmp")
+                snapshot.write_text(json.dumps({"text": widget.get_text()}, ensure_ascii=False))
+                snapshot.replace(args.result)
+            entry.connect("changed", record_user_text)
         elif args.role == "layer":
             button = Gtk.Button(label="Панель · проверить нажатие")
             button.connect("clicked", lambda _: args.result.write_text(json.dumps({"layer_clicked": True})))
@@ -56,6 +63,20 @@ class Fixture(Gtk.Application):
                 data = {"role": args.role, "text": entry.get_text(), "clicked": True}
                 args.result.write_text(json.dumps(data, ensure_ascii=False))
                 result.set_text("Готово: " + entry.get_text())
+            # Report fixture-only logical hit points, independent of the current GTK theme.
+            def record_geometry(*_):
+                if not entry.get_width() or not button.get_width():
+                    return True
+                centers = {}
+                for name, widget in (("entry", entry), ("button", button)):
+                    ok, bounds = widget.compute_bounds(window)
+                    if not ok:
+                        return True
+                    centers[name] = [bounds.get_x() + bounds.get_width() / 2,
+                                     bounds.get_y() + bounds.get_height() / 2]
+                args.result.with_suffix(".geometry.json").write_text(json.dumps(centers))
+                return False
+            window.add_tick_callback(record_geometry)
             button.connect("clicked", save)
             menu = Gtk.MenuButton(label="Открыть всплывающее меню")
             popover = Gtk.Popover()
@@ -68,6 +89,8 @@ class Fixture(Gtk.Application):
             menu.set_popover(popover)
             box.append(menu)
         window.present()
+        if user_window:
+            entry.grab_focus()
 
 
 Fixture().run([])

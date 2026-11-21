@@ -15,7 +15,18 @@ python3 <repo>/scripts/bgui.py doctor --backend host-background
 python3 <repo>/scripts/bgui.py start --backend host-background --window WINDOW_ID
 ```
 
+The v2 patch supports parallel agents pinned to separate native application windows. Each has its own colored pointer. See [parallel window input](references/host-background.md#concurrent-agents-in-different-applications-v2).
+
 The native adapter has protocol/lifecycle tests and a GTK smoke check in a nested patched niri on Fedora 44. That check verified background clicks, Unicode text, preserved focus, the visible agent cursor and detach behavior. Main-session and hardware behavior still need verification after logging into a patched niri session. See the optional [systemd/GDM session examples](references/host-background.md#separate-systemdgdm-session) for a separate login entry. `stop-host` is a hotkey target for detaching the active native attachment.
+
+To work in the *same window* while the user types, the experimental
+`scripts/bgui_widgets.py inspect --window ID` lists named actions exposed by the
+application through AT-SPI. `scripts/bgui_widgets.py invoke --window ID --token TOKEN`
+resolves that action again in the same process, window and widget hierarchy. The
+helper never requests keyboard focus. Individual applications decide what their
+actions do. A widget that handles several records internally still needs an
+application-specific record ID for an operation such as posting to a particular chat.
+This helper requires PyGObject and the Atspi 2.0 introspection library.
 
 The rest of this guide describes `isolated`. Each task gets a private Wayland display with its own input, niri IPC, D-Bus session and clipboard:
 

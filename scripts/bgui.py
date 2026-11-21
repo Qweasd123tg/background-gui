@@ -349,6 +349,8 @@ def stop_owned(path, state):
 
 
 def start(args):
+    if getattr(args, "parallel", False) and (args.backend != "host-background" or args.window is None):
+        raise GuiError("--parallel requires --backend host-background --window ID")
     if args.backend == "host-desktop":
         import host_desktop
         return host_desktop.start(args, sys.modules[__name__])
@@ -564,6 +566,8 @@ def operate(args):
         if read_state(path).get("backend") in ("host-background", "host-desktop"):
             (path / "stop.requested").touch(mode=0o600)
     with locked_session(args.session) as (path, state):
+        if getattr(args, "seen", None) and state.get("backend") != "host-background":
+            raise GuiError("--seen requires a window-addressed host-background session")
         if state.get("backend") == "host-desktop":
             import host_desktop
             return host_desktop.operate(args, path, state, sys.modules[__name__])
@@ -647,6 +651,8 @@ def parser():
     start_p.add_argument("--height", type=int, default=800)
     start_p.add_argument("--name", help="Human-readable project or task label")
     start_p.add_argument("--backend", choices=("isolated", "host-background", "host-desktop"), default="isolated")
+    start_p.add_argument("--parallel", action="store_true",
+                         help="Share the host with agents pinned to other application processes (v2)")
     start_p.add_argument("--window", type=int, help="Existing host window ID for host-background")
     for name in ("run", "launch", "exec"):
         sub = commands.add_parser(name, help="Launch argv in the selected session" + (" and wait" if name == "exec" else ""))
@@ -668,6 +674,7 @@ def parser():
     for name in ("move", "click"):
         sub = commands.add_parser(name); sub.add_argument("session"); sub.add_argument("x", type=int); sub.add_argument("y", type=int)
         if name == "click":
+            sub.add_argument("--seen", help="For host-background, click only if this inspected window image still matches")
             sub.add_argument("--button", choices=("left", "right", "middle"), default="left")
     drag = commands.add_parser("drag", help="Drag within the selected native client")
     drag.add_argument("session")

@@ -93,6 +93,47 @@ the probes do not send input to any window or create a screenshot.
 python3 <repo>/scripts/bgui.py doctor --backend host-background
 ```
 
+## Behavior references
+
+- [Codex background computer use on macOS](https://openai.com/index/codex-for-almost-everything/) demonstrates independent agent cursors while a person works in another app. The public announcement describes the behavior.
+- [Sway seats](https://github.com/swaywm/sway/blob/master/sway/sway-input.5.scd) show how a compositor can maintain distinct pointers and keyboard focus per seat.
+- [The upstream niri integration](https://github.com/lihaoze123/niri-computer-use/blob/bd6e39f3822ab5e14158def4817f89725064061d/docs/agent-input.md) documents the window-directed Wayland input used by this project and its limits with clients sharing one seat.
+- [Pixel Agents](https://github.com/pixel-agents-hq/pixel-agents) visualizes the activities of several coding agents using events. Its activity view is a separate problem from delivering native window input.
+
+## Concurrent agents in different applications (v2)
+
+Start a pinned attachment for each independent application process:
+
+```bash
+python3 scripts/bgui.py start --backend host-background --parallel --window 11 --name Editor
+python3 scripts/bgui.py start --backend host-background --parallel --window 12 --name Calculator
+```
+
+Use each returned session ID with the usual screenshot, move, click, scroll, type
+and key commands. Each session gets a different arrow color (violet, teal, pink or
+blue). Niri sends a complete click or key chord to the selected Wayland client and
+releases that stream before the next batch. A client's application state, such as
+its selected entry, persists between batches. The compositor refuses a batch if
+the user's mouse or keyboard is using its target client. The user can keep focus
+in a third application. Each session is pinned until stopped, including if the
+window closes. Timed drags use an exclusive attachment. One global desktop
+attachment and the parallel window group are mutually exclusive. `stop SESSION`
+releases only that session; `stop-host` detaches the group. The v1 binary supports
+the existing exclusive modes only.
+
+A window screenshot with `--show-pointer` on v2 includes the agent arrow. For an
+action that depends on exactly what was visible, inspect a screenshot taken without
+cursors, then pass its exact path to the click:
+
+```bash
+python3 scripts/bgui.py click SESSION 240 180 --seen /absolute/inspected-frame.png
+```
+
+The helper compares a new window capture with the inspected PNG and checks the
+current title. Any changed pixels (including animations), geometry or title
+invalidate the click. There is still a small interval between validation and
+input. Verify the effect in the application, especially before retrying any send.
+
 ## Existing window on another workspace
 
 Move an independent application window to `Agent` yourself, return to your own

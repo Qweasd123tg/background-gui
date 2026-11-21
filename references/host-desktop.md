@@ -1,7 +1,8 @@
 # Native desktop pointer (experimental)
 
 `host-desktop` draws an agent cursor above the native desktop and routes input to
-the Wayland surface under it. It covers visible windows, their popups and
+the Wayland surface under it. The current patch draws a violet arrow and an amber
+ring at the button-down location. It covers visible windows, their popups and
 layer-shell panels. Clicking selects the agent's keyboard target. Hovering another
 window does not change that target. The real seat pointer location, keyboard focus
 and window activation are preserved. No viewer or special application is needed.
@@ -85,8 +86,8 @@ git -C /absolute/niri apply /absolute/background-gui/assets/niri-agent-desktop.p
 cd /absolute/niri
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v1
-cargo test --locked --release --lib -j 2 desktop_
+export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v2
+cargo test --locked --release --lib -j 2 agent_input::
 cargo build --locked --release --bin niri -j 2
 ```
 
@@ -117,7 +118,19 @@ Use the helper through that scoped environment, inspect captures before input,
 then touch its artifacts directory's `stop` file and stop the outer session.
 Only its own child processes are terminated.
 
-The Fedora 44 nested check verified both application clients receiving Cyrillic
+To exercise the v2 parallel window path, run the following from the Background
+GUI checkout with a new artifacts directory:
+
+```bash
+python3 tests/run_native_parallel.py /absolute/niri/target/release/niri /absolute/path/to/new-artifacts
+```
+
+This runner switches the nested seat's keyboard focus between two GTK windows
+while two agent attachments type into two other GTK windows. It checks all four
+text values, rendered cursor colors, focused window IDs and both detach receipts. The
+test uses the development machine's PyGObject (GTK 4) and Pillow.
+
+The v1 Fedora 44 nested check verified both application clients receiving Cyrillic
 and Unicode, a layer-shell button, popup input, visible cursor over empty desktop,
 preserved user focus, refusal while the user pointer occupied a target client,
 and clean detach. The final executable was additionally checked at scale 1.5

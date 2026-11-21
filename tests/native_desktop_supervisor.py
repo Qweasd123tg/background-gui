@@ -21,6 +21,8 @@ parser.add_argument("--artifacts", type=Path, required=True)
 parser.add_argument("--scale", type=float, choices=(1.0, 1.5, 2.0), default=1.0)
 parser.add_argument("--origin-x", type=int, default=0)
 parser.add_argument("--origin-y", type=int, default=0)
+parser.add_argument("--parallel-windows", action="store_true",
+                    help="Exercise two pinned window agents with a Russian second keyboard layout")
 args = parser.parse_args()
 if not os.environ.get("CODEX_BACKGROUND_GUI_SESSION"):
     parser.error("Run inside an owned isolated bgui session")
@@ -29,7 +31,7 @@ helper = project / "scripts/bgui.py"
 args.artifacts.mkdir(parents=True, exist_ok=False, mode=0o700)
 runtime = Path(tempfile.mkdtemp(prefix="bgui-desktop-test-", dir=os.environ["XDG_RUNTIME_DIR"]))
 processes, logs = [], []
-session, client_env = None, None
+sessions, client_env = [], None
 
 
 def launch(argv, env, name):
@@ -68,6 +70,11 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
     default-floating-position x=1100 y=700 relative-to="top-left";
 }
 ''')
+    if args.parallel_windows:
+        config.write_text(config.read_text().replace("x=680 y=150", "x=970 y=150")
+                          + '\ninput { keyboard { xkb { layout "us,ru"; }; }; }\n'
+                          + 'window-rule { match app-id="dev.codex.DesktopAlternate"; open-floating true; '
+                            'open-focused false; default-floating-position x=40 y=700 relative-to="top-left"; }\n')
     compositor_env = os.environ.copy()
     compositor_env.update(XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY=str(outer_display),
                           XDG_STATE_HOME=str(args.artifacts / "state"))
@@ -84,25 +91,69 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
     display = endpoint.name.removeprefix("niri.").removesuffix(f".{compositor.pid}.sock")
     client_env = compositor_env | {"WAYLAND_DISPLAY": display, "NIRI_SOCKET": str(endpoint)}
     client_env.pop("CODEX_BACKGROUND_GUI_SESSION", None)
-    for role in ("left", "right", "user", "layer"):
+    roles = ("left", "right", "alternate", "user") if args.parallel_windows else ("left", "right", "user", "layer")
+    for role in roles:
         env = client_env | {"LD_PRELOAD": "libgtk4-layer-shell.so"} if role == "layer" else client_env
         launch([sys.executable, str(project / "tests/desktop_fixture.py"), "--role", role,
                 "--result", str(args.artifacts / (role + ".json"))], env, role)
         time.sleep(.3)
     for _ in range(60):
         windows = cli("doctor", "--backend", "host-background")["windows"]
-        if len(windows) >= 3: break
+        if len(windows) >= (4 if args.parallel_windows else 3): break
         time.sleep(.25)
     else: raise RuntimeError("Fixture windows did not appear")
-    attachment = cli("start", "--backend", "host-desktop", "--name", "Глобальный курсор · проверка")
-    session = attachment["session"]
     selected = {k: client_env[k] for k in ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "NIRI_SOCKET",
                                           "DBUS_SESSION_BUS_ADDRESS", "XDG_STATE_HOME")}
     (args.artifacts / "test-env.json").write_text(json.dumps(selected, indent=2))
-    capture = cli("screenshot", session, "--output", "winit", "--path", str(args.artifacts / "initial.png"))
-    ready = {"session": session, "windows_before": windows, "capture": capture,
-             "private_runtime": str(runtime), "compositor_pid": compositor.pid}
+    ready = {"windows_before": windows, "private_runtime": str(runtime), "compositor_pid": compositor.pid}
+    if args.parallel_windows:
+        # This is the fixture's nested compositor, never the host seat.
+        subprocess.run([str(args.binary), "msg", "action", "switch-layout", "next"],
+                       env=client_env, check=True, timeout=5)
+        ready["agents"] = {}
+        for role in ("left", "right"):
+            window = next(w for w in windows if w["app_id"] == "dev.codex.Desktop" + role.title())
+            agent = cli("start", "--backend", "host-background", "--window", str(window["id"]),
+                        "--name", role, "--parallel")
+            sessions.append(agent["session"])
+            ready["agents"][role] = {k: agent[k] for k in ("session", "color")}
+            cli("screenshot", agent["session"], "--path", str(args.artifacts / (role + "-initial.png")))
+    else:
+        attachment = cli("start", "--backend", "host-desktop", "--name", "Глобальный курсор · проверка")
+        session = attachment["session"]
+        sessions.append(session)
+        capture = cli("screenshot", session, "--output", "winit", "--path", str(args.artifacts / "initial.png"))
+        ready.update(session=session, capture=capture)
     (args.artifacts / "ready.json").write_text(json.dumps(ready, ensure_ascii=False, indent=2))
+    if args.parallel_windows:
+        from native_parallel_check import check_parallel
+        def type_as_user(text):
+            subprocess.run(["wtype", "--", text], env=client_env, check=True, timeout=5)
+            layout = json.loads(subprocess.check_output(
+                [str(args.binary), "msg", "--json", "keyboard-layouts"], env=client_env, timeout=5))
+            assert layout["current_idx"] == 1, layout
+        def focus_as_user(window_id):
+            subprocess.run([str(args.binary), "msg", "action", "focus-window", "--id", str(window_id)],
+                           env=client_env, check=True, timeout=5)
+        result = check_parallel(cli, args.artifacts, ready, type_as_user, focus_as_user)
+        # Capture the whole nested output while both per-window cursors are still visible.
+        desktop_frame = args.artifacts / "desktop.png"
+        subprocess.run([str(args.binary), "msg", "action", "screenshot-screen", "--show-pointer", "false",
+                        "--path", str(desktop_frame)], env=client_env, check=True, timeout=5)
+        from PIL import Image
+        for _ in range(50):
+            if desktop_frame.is_file():
+                try:
+                    with Image.open(desktop_frame) as image:
+                        image.verify()
+                    break
+                except OSError:
+                    pass
+            time.sleep(.1)
+        else:
+            raise RuntimeError("Nested compositor did not finish the desktop screenshot")
+        (args.artifacts / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+        (args.artifacts / "stop").touch()
     for _ in range(3000):
         if (args.artifacts / "stop").exists(): break
         if compositor.poll() is not None: raise RuntimeError("Nested niri exited during verification")
@@ -112,9 +163,10 @@ except BaseException as exc:
     (args.artifacts / "error.txt").write_text(str(exc))
     raise
 finally:
-    if session:
+    for session in sessions:
         try:
-            (args.artifacts / "detach.json").write_text(json.dumps(cli("stop", session), indent=2))
+            label = f"detach-{session}.json" if args.parallel_windows else "detach.json"
+            (args.artifacts / label).write_text(json.dumps(cli("stop", session), indent=2))
         except Exception as exc:
             (args.artifacts / "detach-error.txt").write_text(str(exc))
     for proc in reversed(processes):

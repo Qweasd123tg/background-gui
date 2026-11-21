@@ -45,6 +45,7 @@ class FakeNiri:
         self.done = threading.Event()
         self.requests = []
         self.events = []
+        self.parallel_supported = True
         self.patched = True
         self.malformed = None
         self.after_input = None
@@ -65,13 +66,15 @@ class FakeNiri:
         name, value = next(iter(request.items()))
         if not self.patched:
             return {"Err": f"unknown variant `{name}`"}
+        if name == "AgentWindowBatch" and not self.parallel_supported:
+            return {"Err": "unknown request variant"}
         if value["window_id"] == host.PROBE_ID:
             suffix = " on an output" if name == "AgentScreenshot" else ""
             return {"Err": f"no window with id {host.PROBE_ID}{suffix}"}
         if name == "AgentScreenshot":
             Path(value["path"]).write_bytes(png(240, 160))
             return {"Ok": {"AgentScreenshot": self.info}}
-        if name == "AgentInput":
+        if name in ("AgentInput", "AgentWindowBatch"):
             self.events.extend(value["events"])
             if self.after_input:
                 self.after_input(value["events"])
@@ -219,7 +222,8 @@ class HostBackgroundTests(unittest.TestCase):
         self.assertFalse(self.action("status")["running"])
         with self.assertRaisesRegex(host.HostError, "stopped"):
             self.action("type", "should not reach desktop")
-        self.assertTrue(all(r == "Windows" or next(iter(r)) in ("AgentInput", "AgentScreenshot")
+        probe = {"AgentWindowBatch": {"window_id": host.PROBE_ID, "color": 0, "events": []}}
+        self.assertTrue(all(r == "Windows" or r == probe or next(iter(r)) in ("AgentInput", "AgentScreenshot")
                             for r in self.fake.requests))
 
     def test_stock_niri_refused_without_input_or_screenshot(self):
@@ -335,6 +339,71 @@ class HostBackgroundTests(unittest.TestCase):
                 self.action("focus", "4")
                 self.action("type", "Привет")
                 self.assertEqual(self.fake.events[-1]["Text"]["unicode_input"], expected)
+
+    def test_v1_accepts_exclusive_mode_and_refuses_parallel_input(self):
+        self.fake.parallel_supported = False
+        self.assertFalse(host.doctor()["parallel_windows"])
+        args = bgui.parser().parse_args(["start", "--backend", "host-background", "--window", "4", "--parallel"])
+        with self.assertRaisesRegex(host.HostError, "requires.*v2"):
+            bgui.start(args)
+        self.assertFalse(self.fake.events)
+        self.start()
+
+    def test_parallel_targets_keep_distinct_leases_and_colors(self):
+        self.fake.windows.append(dict(self.fake.windows[0], id=6, pid=1003, app_id="second"))
+        def attach(window):
+            return bgui.start(bgui.parser().parse_args(
+                ["start", "--backend", "host-background", "--parallel", "--window", str(window)]))
+        first, second = attach(4), attach(6)
+        self.assertNotEqual(first["color"], second["color"])
+        with self.assertRaisesRegex(host.HostError, "owns this"):
+            attach(4)
+        with self.assertRaisesRegex(host.HostError, "already attached"):
+            self.start()
+        self.session = second["session"]
+        with self.assertRaisesRegex(host.HostError, "pinned"):
+            self.action("focus", "4")
+        self.session = first["session"]
+        self.action("stop")
+        self.session = second["session"]
+        self.action("type", "hello")
+        batch = self.fake.requests[-1]["AgentWindowBatch"]
+        self.assertEqual(batch["window_id"], 6)
+        self.assertEqual(batch["color"], 1)
+        third = attach(4)
+        self.assertEqual(third["color"], first["color"])
+        self.assertEqual(len(host.stop_current(bgui)["sessions"]), 2)
+        self.start()
+
+    def test_border_resize_during_capture_publishes_only_stable_geometry(self):
+        self.start()
+        original = self.fake.reply
+        calls = []
+        def resize_once(request):
+            result = original(request)
+            if isinstance(request, dict) and "AgentScreenshot" in request:
+                calls.append(request)
+                if len(calls) == 1:
+                    self.fake.windows[0]["layout"]["window_size"] = [108, 68]
+            return result
+        self.fake.reply = resize_once
+        self.action("screenshot")
+        self.action("click", "10", "10")
+        self.assertEqual(len(calls), 2)
+
+    def test_inspected_click_refuses_changed_image_and_title(self):
+        self.start()
+        image = self.action("screenshot")["path"]
+        self.action("click", "10", "10", "--seen", image)
+        events = self.fake.events[:]
+        self.fake.windows[0]["title"] = "another conversation"
+        with self.assertRaisesRegex(host.HostError, "title changed"):
+            self.action("click", "10", "10", "--seen", image)
+        self.fake.windows[0]["title"] = "Agent"
+        with mock.patch(__name__ + ".png", return_value=Path(image).read_bytes() + b"changed"):
+            with self.assertRaisesRegex(host.HostError, "contents changed"):
+                self.action("click", "10", "10", "--seen", image)
+        self.assertEqual(self.fake.events, events)
 
     def test_single_compositor_attachment_and_lease_release(self):
         self.start()
