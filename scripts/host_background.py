@@ -47,6 +47,10 @@ class HostError(ValueError):
     pass
 
 
+class FocusConflict(HostError):
+    pass
+
+
 class ReplyError(HostError):
     pass
 
@@ -211,8 +215,7 @@ def target(client, window_id, pinned=None, for_input=False):
         focused = next((w for w in windows if w.get("is_focused")), None)
         if focused and (focused["id"] == window_id or
                         (window.get("pid") is not None and focused.get("pid") == window["pid"])):
-            raise HostError("The user is focused on the target window or its process; "
-                            "move focus away before background input. Use a separate browser profile")
+            raise FocusConflict("The user is focused on the target window or its process")
     return window
 
 
@@ -254,7 +257,7 @@ def start(args, core, backend=BACKEND, probe=None):
     parallel = getattr(args, "parallel", False)
     if parallel and not parallel_supported(client):
         raise HostError("Parallel window input requires a running AgentWindowBatch compositor (v2)")
-    window = target(client, args.window, for_input=True) if args.window is not None else None
+    window = target(client, args.window) if args.window is not None else None
     name = core.session_name(args.name) if args.name is not None else (window or {}).get("title")
     with compositor_lock(core, client.identity) as lease:
         agents = {}
@@ -380,7 +383,7 @@ def verify_inspected_image(path, state, client, seen):
                 ("scale", "geometry_x", "geometry_y", "width", "height"))
             or hashlib.sha256(pending.read_bytes()).hexdigest() != capture.get("sha256")):
             raise HostError("Window contents changed; inspect a new screenshot before clicking")
-    window = target(client, target_id(state), state["target"], for_input=True)
+    window = target(client, target_id(state), state["target"])
     if window.get("title") != capture.get("title") or (path / "stop.requested").exists():
         raise HostError("Window title changed or stop requested")
 
@@ -409,18 +412,101 @@ def send(client, state, events):
         raise HostError("Unexpected AgentInput reply; input was not retried")
 
 
+def shared_action(args, path, state, client):
+    import bgui_widgets
+    window = target(client, target_id(state), state["target"])
+    command = args.command
+    if command in ("click", "move") and (command == "move" or args.button == "left"):
+        motion = position(state, window, args.x, args.y)["Motion"]
+        point = [motion["x"], motion["y"]]
+    elif command == "type" and state.get("shared_entry"):
+        if len(args.text) > 4096:
+            raise HostError("Type at most 4096 characters per call")
+        point = state["shared_entry"]["point"]
+    else:
+        raise HostError("The user is focused on the target or sharing its pointer. "
+                        "Click an accessible button or select an editable field before typing")
+
+    def authorize():
+        current = target(client, window["id"], state["target"])
+        if (path / "stop.requested").exists() or current["title"] != window["title"]:
+            raise HostError("Target changed or stop requested")
+        if command == "click" and getattr(args, "seen", None):
+            verify_inspected_image(path, state, client, args.seen)
+        # Niri verifies the session is unlocked and the point is on the pinned
+        # window. This request only paints feedback, even on older v2 builds.
+        reply = client.request({"AgentIndicateAction": {
+            "window_id": window["id"], "x": point[0], "y": point[1],
+            "pressed": command == "click", "color": state.get("color", 0)}})
+        if reply != "Handled":
+            raise HostError("Unable to indicate the shared window target")
+        return current
+    if command == "move":
+        authorize()
+        operation = "move"
+    else:
+        operation = bgui_widgets.operate_shared(state, window, point,
+                                                args.text if command == "type" else None, authorize)
+    if command in ("move", "click"):
+        state["pointer"] = [args.x, args.y]
+    return {"session": state["id"], "backend": BACKEND, "window": window["id"],
+            "action": command, "shared_action": operation}
+
+
 def input_action(args, path, state, client):
-    window = target(client, target_id(state), state["target"], for_input=True)
+    if (path / "stop.requested").exists():
+        raise HostError("Stop requested")
+    selected = state.get("shared_entry")
+    if selected and not selected.get("native"):
+        if args.command == "type":
+            return shared_action(args, path, state, client)
+        if args.command == "key":
+            raise HostError("The agent selected a shared text field; use type or click the intended control")
+    try:
+        window = target(client, target_id(state), state["target"], for_input=True)
+    except FocusConflict:
+        return shared_action(args, path, state, client)
+    try:
+        result = window_action(args, path, state, client, window)
+    except FocusConflict:
+        if args.command == "drag":
+            raise
+        return shared_action(args, path, state, client)
+    except ReplyError as exc:
+        # Only this specific v2 error precedes the entire batch. Never replay
+        # a partially dispatched gesture, a timeout or a lost acknowledgment.
+        if "color" not in state or str(exc) != "the user is using this client" or args.command == "drag":
+            raise
+        return shared_action(args, path, state, client)
+    if args.command in ("key", "drag"):
+        state.pop("shared_entry", None)
+    if args.command == "type" and selected:
+        selected["offset"] += len(args.text)
+    return result
+
+
+def window_action(args, path, state, client, window):
     if (path / "stop.requested").exists():
         raise HostError("Stop requested")
     command = args.command
     if command in ("move", "click"):
         events = [position(state, window, args.x, args.y)]
         if command == "click":
-            if getattr(args, "seen", None):
-                verify_inspected_image(path, state, client, args.seen)
             events.extend({"Button": {"button": BUTTONS[args.button], "pressed": p}} for p in (True, False))
+        remembered = None
+        if command == "click" and args.button == "left" and state["host_env"].get("DBUS_SESSION_BUS_ADDRESS"):
+            import bgui_widgets
+            remembered = bgui_widgets.remember_entry(state, window, events[0]["Motion"])
+        if command == "click" and getattr(args, "seen", None):
+            verify_inspected_image(path, state, client, args.seen)
+        if (path / "stop.requested").exists():
+            raise HostError("Stop requested")
+        target(client, window["id"], state["target"], for_input=True)
         send(client, state, events)
+        if command == "click":
+            state.pop("shared_entry", None)
+            if remembered:
+                state["shared_entry"] = remembered
     elif command == "scroll":
         if not all(math.isfinite(v) and abs(v) <= 1000000 for v in (args.vertical, args.horizontal)):
             raise HostError("Scroll values must be finite and within +/-1000000 logical pixels")
@@ -536,7 +622,8 @@ def operate(args, path, state, core):
     if args.command == "focus":
         if "color" in state and args.window != target_id(state):
             raise HostError("Parallel sessions are pinned to their selected window")
-        window = target(client, args.window, for_input=True)
+        window = target(client, args.window)
+        state.pop("shared_entry", None)
         # In host-background this selects an input target; it does not focus the seat.
         state["target"] = pin(window)
         state.pop("capture", None)

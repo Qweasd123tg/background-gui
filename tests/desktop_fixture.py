@@ -13,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 if args.role == "layer":
     gi.require_version("Gtk4LayerShell", "1.0")
     from gi.repository import Gtk4LayerShell
-from gi.repository import Gtk, Gio
+from gi.repository import Gtk, Gio, Gdk
 
 
 class Fixture(Gtk.Application):
@@ -88,6 +88,25 @@ class Fixture(Gtk.Application):
             popover.set_child(popup_button)
             menu.set_popover(popover)
             box.append(menu)
+            if args.role == "left":
+                other = Gtk.Entry(placeholder_text="Shared window: user input")
+                box.append(other)
+                keys = Gtk.EventControllerKey.new()
+                keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+                def focus_other(controller, keyval, keycode, mods):
+                    if keyval != Gdk.KEY_F6:
+                        return False
+                    other.grab_focus()
+                    return True
+                keys.connect("key-pressed", focus_other)
+                window.add_controller(keys)
+                def save_shared(widget):
+                    destination = args.result.with_suffix(".shared.json")
+                    tmp = destination.with_suffix(".tmp")
+                    tmp.write_text(json.dumps({"user": other.get_text(), "agent": entry.get_text()},
+                                              ensure_ascii=False))
+                    tmp.replace(destination)
+                other.connect("changed", save_shared)
         window.present()
         if user_window:
             entry.grab_focus()

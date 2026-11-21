@@ -113,10 +113,21 @@ Use each returned session ID with the usual screenshot, move, click, scroll, typ
 and key commands. Each session gets a different arrow color (violet, teal, pink or
 blue). Niri sends a complete click or key chord to the selected Wayland client and
 releases that stream before the next batch. A client's application state, such as
-its selected entry, persists between batches. The compositor refuses a batch if
-the user's mouse or keyboard is using its target client. The user can keep focus
-in a third application. Each session is pinned until stopped, including if the
-window closes. Timed drags use an exclusive attachment. One global desktop
+its selected entry, persists between batches.
+
+If the user takes focus in the target client, the helper routes ordinary left
+clicks and text to the application's accessibility tree. It matches the widget
+using the window screenshot's logical coordinates. A button receives its
+published action. Clicking an editable field selects it for the agent. Later
+`type` commands insert at the agent's position while the user types in another
+field. When the app omits character hit-testing, insertion starts at the end of
+the field. The helper also remembers an accessible entry selected before a focus
+change. A new window selection clears that binding. Shared editing requires
+PyGObject and the Atspi 2.0 introspection library. Custom-drawn controls without
+an accessible action, keys, right clicks and drags require independent window
+input. Give each typist a separate field.
+
+Each session is pinned until stopped, including if the window closes. Timed drags use an exclusive attachment. One global desktop
 attachment and the parallel window group are mutually exclusive. `stop SESSION`
 releases only that session; `stop-host` detaches the group. The v1 binary supports
 the existing exclusive modes only.
@@ -165,7 +176,7 @@ may have been partially delivered.
 `windows SESSION` lists native windows. `watch SESSION` reports where to watch;
 it does not open the isolated observer. See the real window and its agent cursor
 by switching to its workspace yourself. The cursor is a compositor decoration,
-so it is absent from `AgentScreenshot` images and some screencasts.
+and v2+ window captures include it with `--show-pointer`.
 
 ## Launch a separate application instance
 
@@ -200,13 +211,12 @@ needing its session ID, and can be bound to a hotkey. A bounded drag notices the
 stop request between steps and releases its button. A request already accepted
 by the compositor cannot be retracted.
 
-Before input, the adapter checks whether the target window or another window
-with its PID has real keyboard focus. If so, input is refused until you move
-focus away. This is a best-effort preflight check, **not** atomic exclusion of
-physical input: shared clients, focus races and a real pointer grab remain limits
-of the upstream patch. Use a separate browser process/profile. One Background GUI
-attachment is allowed per compositor; do not drive it with another agent tool
-at the same time. Use isolated sessions for parallel tasks.
+A focused process can be attached and captured. Shared left clicks and text use
+the selected application's controls. Move paints a window-local marker. v3 uses
+the configured Xcursor arrow, size and hotspot and keeps the session color for
+accessibility actions. If the application does not expose the selected widget,
+the helper reports the failed hit. Gesture errors and missing acknowledgments
+are never replayed. Independent processes can use the pinned parallel mode.
 
 Wayland clipboard and cross-application drag-and-drop remain upstream limits.
 In-app drag is supported; universal application compatibility is not established.

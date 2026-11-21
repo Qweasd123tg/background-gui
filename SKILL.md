@@ -24,6 +24,12 @@ does not provide it. Use the same helper commands, but note the mode differences
   --seen /absolute/inspected-frame.png` in window mode; inspect the fresh image if
   the check reports a change. Verify delivery before retrying.
 
+- When the user shares the target application, use a window attachment, inspect
+  its screenshot and use ordinary `click` on an accessible button or editable
+  field. `type` then addresses the selected field independently of the user's
+  field. If the application exposes no control at that point, report which
+  action could not be delivered. v3 follows the desktop's Xcursor arrow shape.
+
 When the user wants a second visible mouse across the native desktop, read
 [host-desktop.md](references/host-desktop.md) and use the explicit `host-desktop`
 backend after its own doctor reports ready. It requires the additional bundled

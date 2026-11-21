@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--scale", type=float, choices=(1, 1.5, 2), default=1)
     args = parser.parse_args()
     artifacts = args.directory.absolute()
     artifacts.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -28,11 +29,12 @@ def main():
             raise RuntimeError(p.stdout + p.stderr)
         return json.loads(p.stdout)
 
-    session = cli("start", "--name", "Parallel GTK verification", "--width", "1600", "--height", "1000")["session"]
+    session = cli("start", "--name", "Parallel GTK verification", "--width", str(round(1600 * args.scale)),
+                  "--height", str(round(1000 * args.scale)))["session"]
     owned = artifacts / "inner"
     try:
         launch = cli("run", session, "--", sys.executable, str(repo / "tests/native_desktop_supervisor.py"),
-                     "--binary", str(args.binary.resolve()), "--artifacts", str(owned), "--parallel-windows")
+                     "--binary", str(args.binary.resolve()), "--artifacts", str(owned), "--scale", str(args.scale), "--parallel-windows")
         for _ in range(300):
             if (owned / "stopped").exists():
                 break

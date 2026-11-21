@@ -1,8 +1,8 @@
 diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
-index c41f5fc..42c4468 100644
+index c41f5fc..c0edb83 100644
 --- a/niri-ipc/src/lib.rs
 +++ b/niri-ipc/src/lib.rs
-@@ -131,6 +131,41 @@ pub enum Request {
+@@ -131,6 +131,47 @@ pub enum Request {
          /// Events to deliver, in order.
          events: Vec<AgentEvent>,
      },
@@ -29,6 +29,12 @@ index c41f5fc..42c4468 100644
 +        x: f64,
 +        /// Window-relative logical Y.
 +        y: f64,
++        /// Marker color for parallel agents. Defaults to the first color.
++        #[serde(default)]
++        color: u8,
++        /// Show a click ring unless the caller requested only pointer motion.
++        #[serde(default)]
++        pressed: Option<bool>,
 +    },
 +    /// Hide the desktop pointer and release the agent's pressed buttons and keys.
 +    AgentDesktopStop,
@@ -44,7 +50,7 @@ index c41f5fc..42c4468 100644
      /// Screenshot one window to a PNG file with no side effects.
      ///
      /// Unlike the `ScreenshotWindow` action, this neither shows a notification nor replaces the
-@@ -174,6 +209,22 @@ pub struct AgentScreenshotInfo {
+@@ -174,6 +215,22 @@ pub struct AgentScreenshotInfo {
      pub geometry_y: i32,
  }
  
@@ -67,7 +73,7 @@ index c41f5fc..42c4468 100644
  /// Event for [`Request::AgentInput`].
  #[derive(Debug, Serialize, Deserialize, Clone)]
  #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-@@ -255,6 +306,8 @@ pub enum Response {
+@@ -255,6 +312,8 @@ pub enum Response {
      Handled,
      /// Result of [`Request::AgentScreenshot`].
      AgentScreenshot(AgentScreenshotInfo),
@@ -77,7 +83,7 @@ index c41f5fc..42c4468 100644
      Version(String),
      /// Information about connected outputs.
 diff --git a/src/agent_input.rs b/src/agent_input.rs
-index 58d736f..700734e 100644
+index 58d736f..06eb143 100644
 --- a/src/agent_input.rs
 +++ b/src/agent_input.rs
 @@ -13,6 +13,9 @@
@@ -85,7 +91,7 @@ index 58d736f..700734e 100644
  //! meanwhile mixes with the agent's input.
  
 +mod desktop;
-+mod arrow;
++pub(crate) mod arrow;
 +
  use niri_ipc::{AgentActivityKind, AgentEvent, AgentScreenshotInfo, AgentUnicodeInput};
  use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, WindowSurfaceType};
@@ -326,11 +332,11 @@ index 58d736f..700734e 100644
                  }
                  Ok(())
              }
-@@ -1032,6 +1078,25 @@ impl State {
+@@ -1032,6 +1078,30 @@ impl State {
          true
      }
  
-+    pub fn agent_indicate_action(&mut self, window_id: u64, x: f64, y: f64) -> Result<(), String> {
++    pub fn agent_indicate_action(&mut self, window_id: u64, x: f64, y: f64, color: u8, pressed: bool) -> Result<(), String> {
 +        if self.niri.is_locked() {
 +            return Err("session locked".into());
 +        }
@@ -340,10 +346,15 @@ index 58d736f..700734e 100644
 +            return Err("marker outside window".into());
 +        }
 +        let now = Instant::now();
-+        let mut cursor = AgentCursor::new(Point::from((x, y)), now);
-+        cursor.set_pressed(true, now);
-+        cursor.set_pressed(false, now);
-+        self.niri.agent_input.cursors.insert(window_id, cursor);
++        let point = Point::from((x, y));
++        let cursor = self.niri.agent_input.cursors.entry(window_id)
++            .or_insert_with(|| AgentCursor::new(point, now));
++        cursor.move_to(point, now);
++        cursor.color = color;
++        if pressed {
++            cursor.set_pressed(true, now);
++            cursor.set_pressed(false, now);
++        }
 +        self.agent_mark_window(window_id);
 +        self.niri.queue_redraw_all();
 +        Ok(())
@@ -352,7 +363,7 @@ index 58d736f..700734e 100644
      /// Mark a window as agent-driven for a while.
      fn agent_mark_window(&mut self, window_id: u64) {
          let state = &mut self.niri.agent_input;
-@@ -1187,6 +1252,17 @@ impl State {
+@@ -1187,6 +1257,17 @@ impl State {
                  warn!("error sending agent keymap: {err:?}");
              }
          }
@@ -370,7 +381,7 @@ index 58d736f..700734e 100644
      }
  
      /// Send modifiers derived from the agent's own pressed keys (not the user's).
-@@ -1197,6 +1273,10 @@ impl State {
+@@ -1197,6 +1278,10 @@ impl State {
              // SAFETY: the temporary state is dropped before the lock is released.
              let keymap = unsafe { xkb.keymap() };
              let mut state = xkb::State::new(keymap);
@@ -381,7 +392,7 @@ index 58d736f..700734e 100644
              for key in pressed {
                  state.update_key(Keycode::new(key + 8), xkb::KeyDirection::Down);
              }
-@@ -1241,6 +1321,9 @@ impl Niri {
+@@ -1241,6 +1326,9 @@ impl Niri {
                  redraw.extend(output.cloned());
              }
          });
@@ -391,7 +402,7 @@ index 58d736f..700734e 100644
          for output in redraw {
              self.queue_redraw(&output);
          }
-@@ -1253,6 +1336,54 @@ mod tests {
+@@ -1253,6 +1341,54 @@ mod tests {
      use crate::tests::client::KeyboardEvent;
      use crate::tests::fixture::Fixture;
  
@@ -448,13 +459,14 @@ index 58d736f..700734e 100644
          let mut f = Fixture::new();
 diff --git a/src/agent_input/arrow.rs b/src/agent_input/arrow.rs
 new file mode 100644
-index 0000000..23bbe34
+index 0000000..cb5b601
 --- /dev/null
 +++ b/src/agent_input/arrow.rs
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,120 @@
++use std::cell::RefCell;
++use std::collections::HashMap;
 +use std::time::Instant;
 +
-+use pangocairo::cairo::{Context, Format, ImageSurface, LineJoin};
 +use smithay::backend::allocator::Fourcc;
 +use smithay::backend::renderer::element::memory::{
 +    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
@@ -463,54 +475,67 @@ index 0000000..23bbe34
 +use smithay::utils::{Logical, Physical, Point, Scale, Transform};
 +
 +use super::AgentCursor;
++use crate::cursor::{CursorManager, XCursor};
 +use crate::render_helpers::renderer::NiriRenderer;
 +
-+// Rasterize once at 3x so the same outline stays crisp on fractional-scale outputs.
-+// Tip in logical coordinates, including padding around its stroke.
-+const TIP: (f64, f64) = (2.5, 2.5);
++const COLORS: [[u8; 3]; 4] = [
++    [145, 92, 255],
++    [20, 184, 176],
++    [242, 89, 130],
++    [61, 158, 255],
++];
 +
-+const COLORS: [(f64, f64, f64); 4] = [(0.57, 0.36, 1.), (0.08, 0.72, 0.69), (0.95, 0.35, 0.51), (0.24, 0.62, 1.)];
-+
-+fn draw_arrow(color: (f64, f64, f64)) -> MemoryRenderBuffer {
-+    let mut surface = ImageSurface::create(Format::ARgb32, 90, 114).unwrap();
-+    {
-+        let ctx = Context::new(&surface).unwrap();
-+        ctx.scale(3., 3.);
-+        ctx.move_to(TIP.0, TIP.1);
-+        for (x, y) in [
-+            (24., 19.),
-+            (14., 20.),
-+            (19., 31.),
-+            (13., 34.),
-+            (8., 23.),
-+            (2.5, 30.),
-+        ] {
-+            ctx.line_to(x, y);
-+        }
-+        ctx.close_path();
-+        ctx.set_line_join(LineJoin::Round);
-+        ctx.set_source_rgb(0.13, 0.08, 0.22);
-+        ctx.set_line_width(4.);
-+        ctx.stroke_preserve().unwrap();
-+        ctx.set_source_rgb(1., 1., 1.);
-+        ctx.set_line_width(2.);
-+        ctx.stroke_preserve().unwrap();
-+        ctx.set_source_rgb(color.0, color.1, color.2);
-+        ctx.fill().unwrap();
-+    }
-+    let data = surface.data().unwrap();
-+    MemoryRenderBuffer::from_slice(
-+        &data,
-+        Fourcc::Argb8888,
-+        (90, 114),
-+        3,
-+        Transform::Normal,
-+        None,
-+    )
++struct ArrowCache {
++    theme: CursorManager,
++    buffers: HashMap<(i32, u8, usize), MemoryRenderBuffer>,
 +}
 +
 +thread_local! {
-+    static ARROWS: [MemoryRenderBuffer; 4] = COLORS.map(draw_arrow);
++    static ARROWS: RefCell<Option<ArrowCache>> = const { RefCell::new(None) };
++}
++
++// Tiles and screen captures render on the compositor thread. Reload the same
++// named default cursor as the seat, including theme inheritance and fallback.
++pub(crate) fn configure(theme: &str, size: u8) {
++    ARROWS.with_borrow_mut(|slot| {
++        *slot = Some(ArrowCache {
++            theme: CursorManager::for_theme(theme, size),
++            buffers: HashMap::new(),
++        });
++    });
++}
++
++fn luminance(pixel: &[u8]) -> u16 {
++    (u16::from(pixel[0]) + 2 * u16::from(pixel[1]) + u16::from(pixel[2])) / 4
++}
++
++fn tinted_pixels(source: &[u8], [red, green, blue]: [u8; 3]) -> Vec<u8> {
++    // Xcursor stores premultiplied BGRA pixels. Replace the dominant opaque fill
++    // and retain the theme's contrasting outline, shadow and exact alpha mask.
++    let mut shades = [0_u32; 16];
++    for pixel in source.chunks_exact(4).filter(|p| p[3] == 255) {
++        shades[usize::from(luminance(pixel) / 16)] += 1;
++    }
++    let fill = shades
++        .iter()
++        .enumerate()
++        .max_by_key(|(_, n)| **n)
++        .unwrap()
++        .0 as u16;
++    let mut pixels = source.to_vec();
++    for p in pixels.chunks_exact_mut(4) {
++        let alpha = u16::from(p[3]);
++        if alpha == 0 {
++            continue;
++        }
++        let shade = (luminance(p) * 255 / alpha).min(255) / 16;
++        let weight = 4 - fill.abs_diff(shade).min(4);
++        for (channel, tint) in p[..3].iter_mut().zip([blue, green, red]) {
++            let premult = u16::from(tint) * alpha / 255;
++            *channel = ((u16::from(*channel) * (4 - weight) + premult * weight) / 4) as u8;
++        }
++    }
++    pixels
 +}
 +
 +impl AgentCursor {
@@ -520,14 +545,35 @@ index 0000000..23bbe34
 +        origin: Point<f64, Logical>,
 +        scale: Scale<f64>,
 +    ) -> Option<MemoryRenderBufferRenderElement<R>> {
-+        let pos: Point<f64, Physical> = (origin + self.position(Instant::now()) - Point::from(TIP))
-+            .to_physical_precise_round(scale);
-+        ARROWS.with(|arrows| {
-+            let buf = &arrows[usize::from(self.color) % arrows.len()];
++        ARROWS.with_borrow_mut(|cache| {
++            let cache = cache.as_mut()?;
++            let int_scale = scale.x.ceil() as i32;
++            let cursor = cache.theme.get_default_cursor(int_scale);
++            let (idx, frame) = cursor.frame(self.shown_at.elapsed().as_millis() as u32);
++            let buffer = cache
++                .buffers
++                .entry((int_scale, self.color, idx))
++                .or_insert_with(|| {
++                    let pixels = tinted_pixels(
++                        &frame.pixels_rgba,
++                        COLORS[usize::from(self.color) % COLORS.len()],
++                    );
++                    MemoryRenderBuffer::from_slice(
++                        &pixels,
++                        Fourcc::Argb8888,
++                        (frame.width as i32, frame.height as i32),
++                        int_scale,
++                        Transform::Normal,
++                        None,
++                    )
++                });
++            let hotspot = XCursor::hotspot(frame).to_logical(int_scale).to_f64();
++            let pos: Point<f64, Physical> =
++                (origin + self.position(Instant::now()) - hotspot).to_physical_precise_round(scale);
 +            MemoryRenderBufferRenderElement::from_buffer(
 +                renderer,
 +                pos,
-+                buf,
++                buffer,
 +                None,
 +                None,
 +                None,
@@ -1061,8 +1107,32 @@ index 0000000..343640f
 +        Some((cursor, origin.upscale(-1.)))
 +    }
 +}
+diff --git a/src/cursor.rs b/src/cursor.rs
+index a856de9..3b277b3 100644
+--- a/src/cursor.rs
++++ b/src/cursor.rs
+@@ -31,6 +31,11 @@ impl CursorManager {
+     pub fn new(theme: &str, size: u8) -> Self {
+         Self::ensure_env(theme, size);
+ 
++        crate::agent_input::arrow::configure(theme, size);
++        Self::for_theme(theme, size)
++    }
++
++    pub(crate) fn for_theme(theme: &str, size: u8) -> Self {
+         let theme = CursorTheme::load(theme);
+ 
+         Self {
+@@ -44,6 +49,7 @@ impl CursorManager {
+     /// Reload the cursor theme.
+     pub fn reload(&mut self, theme: &str, size: u8) {
+         Self::ensure_env(theme, size);
++        crate::agent_input::arrow::configure(theme, size);
+         self.theme = CursorTheme::load(theme);
+         self.size = size;
+         self.named_cursor_cache.get_mut().clear();
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index 5e1337e..df24249 100644
+index 5e1337e..3da5439 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
 @@ -456,6 +456,52 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
@@ -1085,10 +1155,10 @@ index 5e1337e..df24249 100644
 +            rx.recv().await.map_err(|_| "could not deliver window action".to_string())??;
 +            Response::Handled
 +        }
-+        Request::AgentIndicateAction { window_id, x, y } => {
++        Request::AgentIndicateAction { window_id, x, y, color, pressed } => {
 +            let (tx, rx) = async_channel::bounded(1);
 +            ctx.event_loop.insert_idle(move |state| {
-+                let _ = tx.send_blocking(state.agent_indicate_action(window_id, x, y));
++                let _ = tx.send_blocking(state.agent_indicate_action(window_id, x, y, color, pressed.unwrap_or(true)));
 +            });
 +            rx.recv().await.map_err(|_| "could not show widget action".to_string())??;
 +            Response::Handled

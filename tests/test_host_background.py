@@ -74,6 +74,8 @@ class FakeNiri:
         if name == "AgentScreenshot":
             Path(value["path"]).write_bytes(png(240, 160))
             return {"Ok": {"AgentScreenshot": self.info}}
+        if name == "AgentIndicateAction":
+            return {"Ok": "Handled"}
         if name in ("AgentInput", "AgentWindowBatch"):
             self.events.extend(value["events"])
             if self.after_input:
@@ -160,6 +162,8 @@ class HostBackgroundTests(unittest.TestCase):
             "CODEX_BACKGROUND_GUI_SESSION": "", "WAYLAND_SOCKET": "",
         })
         self.env.start()
+        # This simulated IPC server has no application accessibility tree.
+        self.transports.enter_context(mock.patch("bgui_widgets.remember_entry", return_value=None))
 
     def tearDown(self):
         self.env.stop()
@@ -265,14 +269,15 @@ class HostBackgroundTests(unittest.TestCase):
             self.action("move", "48", "28")
         self.assertEqual(self.fake.events, [])
 
-    def test_focused_target_and_same_process_refused(self):
+    def test_focused_target_and_same_process_allow_read_only_attach(self):
         for same_process in (False, True):
             with self.subTest(same_process=same_process):
                 self.fake.windows[0]["is_focused"] = not same_process
                 self.fake.windows[1]["pid"] = 1001 if same_process else 1002
-                with self.assertRaisesRegex(host.HostError, "user is focused"):
-                    self.start()
-        self.assertEqual(self.fake.events, [])
+                self.start()
+                self.assertFalse(self.fake.events)
+                self.action("stop")
+                self.fake.events.clear()
 
     def test_user_focus_after_attach_blocks_input(self):
         self.start()
@@ -280,6 +285,31 @@ class HostBackgroundTests(unittest.TestCase):
         with self.assertRaisesRegex(host.HostError, "user is focused"):
             self.action("type", "blocked")
         self.assertEqual(self.fake.events, [])
+
+    def test_shared_move_paints_without_seat_events(self):
+        self.start()
+        self.action("screenshot")
+        self.fake.windows[1]["pid"] = 1001
+        result = self.action("move", "48", "28")
+        self.assertEqual(result["shared_action"], "move")
+        self.assertEqual(self.fake.requests[-1]["AgentIndicateAction"],
+                         {"window_id": 4, "x": 20, "y": 10, "color": 0, "pressed": False})
+        self.assertFalse(self.fake.events)
+
+    def test_shared_click_never_replays_an_ambiguous_compositor_failure(self):
+        self.session = bgui.start(bgui.parser().parse_args(
+            ["start", "--backend", "host-background", "--window", "4", "--parallel"]))["session"]
+        self.action("screenshot")
+        reply = self.fake.reply
+        def fail_batch(request):
+            if isinstance(request, dict) and "AgentWindowBatch" in request:
+                return {"Err": "window closed after button press"}
+            return reply(request)
+        self.fake.reply = fail_batch
+        with mock.patch("bgui_widgets.operate_shared") as fallback:
+            with self.assertRaisesRegex(host.HostError, "after button press"):
+                self.action("click", "48", "28")
+            fallback.assert_not_called()
 
     def test_closed_or_reused_window_refused(self):
         self.start()

@@ -92,6 +92,18 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
     client_env = compositor_env | {"WAYLAND_DISPLAY": display, "NIRI_SOCKET": str(endpoint)}
     client_env.pop("CODEX_BACKGROUND_GUI_SESSION", None)
     roles = ("left", "right", "alternate", "user") if args.parallel_windows else ("left", "right", "user", "layer")
+    if args.parallel_windows:
+        # Separate accessibility registry for the two inputs into one Wayland client.
+        # Both socket and services belong to this fixture.
+        atspi_socket = runtime / "accessibility-bus"
+        address = "unix:path=" + str(atspi_socket)
+        launch(["dbus-daemon", "--session", "--nofork", "--address=" + address], client_env, "a11y-bus")
+        for _ in range(100):
+            if atspi_socket.is_socket(): break
+            time.sleep(.02)
+        client_env.update(AT_SPI_BUS_ADDRESS=address, GTK_A11Y="atspi")
+        registry = shutil.which("at-spi2-registryd") or "/usr/libexec/at-spi2-registryd"
+        launch([registry], client_env, "a11y-registry")
     for role in roles:
         env = client_env | {"LD_PRELOAD": "libgtk4-layer-shell.so"} if role == "layer" else client_env
         launch([sys.executable, str(project / "tests/desktop_fixture.py"), "--role", role,
@@ -152,6 +164,46 @@ window-rule { match app-id="dev.codex.DesktopUser"; open-floating true; open-foc
             time.sleep(.1)
         else:
             raise RuntimeError("Nested compositor did not finish the desktop screenshot")
+        # The first agent now shares its *focused* GTK window with the user's seat.
+        first = ready["agents"]["left"]["session"]
+        wid = next(w["id"] for w in windows if w["app_id"] == "dev.codex.DesktopLeft")
+        geometry = json.loads((args.artifacts / "left.geometry.json").read_text())
+        frame = cli("screenshot", first)
+        def click_control(widget):
+            x, y = geometry[widget]
+            return cli("click", first, str(round(x*frame["scale"] + frame["geometry_x"])),
+                       str(round(y*frame["scale"] + frame["geometry_y"])))
+        # Select with native input, then let the real user take window focus
+        # between the agent's click and its next type command.
+        assert "shared_action" not in click_control("entry")
+        focus_as_user(wid)
+        subprocess.run(["wtype", "-k", "F6"], env=client_env, check=True, timeout=5)
+        type_as_user("before")
+        assert cli("type", first, " Я")["shared_action"] == "insert"
+        assert click_control("entry")["shared_action"] == "select-entry"
+        assert cli("type", first, " ✓")["shared_action"] == "insert"
+        assert click_control("button")["shared_action"] == "invoke"
+        type_as_user("after")
+        for _ in range(40):
+            received = json.loads((args.artifacts / "left.shared.json").read_text())
+            if received["user"] == "beforeafter": break
+            time.sleep(.05)
+        assert received["user"] == "beforeafter" and " Я" in received["agent"], received
+        assert json.loads((args.artifacts / "left.json").read_text())["text"] == received["agent"]
+        assert next(w["id"] for w in cli("windows", first) if w["is_focused"]) == wid
+        result["shared_window"] = received
+        cli("screenshot", first, "--show-pointer", "--path", str(args.artifacts / "shared-after.png"))
+        version = json.loads(subprocess.check_output([str(args.binary), "msg", "--json", "version"],
+                                                     env=client_env, timeout=5))
+        if version["compositor"].endswith("-v3"):
+            # Leave the arrow over a flat patch so the renderer can be compared
+            # against the original Xcursor mask independently of the text caret.
+            x, y = frame["width"]*3//4, frame["height"]*9//10
+            cli("move", first, str(x), str(y))
+            time.sleep(1)
+            cli("screenshot", first, "--path", str(args.artifacts/"cursor-background.png"))
+            sample = cli("screenshot", first, "--show-pointer", "--path", str(args.artifacts/"cursor-theme.png"))
+            result["cursor_sample"] = {"x": x, "y": y, "scale": sample["scale"]}
         (args.artifacts / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
         (args.artifacts / "stop").touch()
     for _ in range(3000):

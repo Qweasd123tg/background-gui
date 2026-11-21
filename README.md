@@ -19,6 +19,11 @@ The v2 patch supports parallel agents pinned to separate native application wind
 
 The native adapter has protocol/lifecycle tests and a GTK smoke check in a nested patched niri on Fedora 44. That check verified background clicks, Unicode text, preserved focus, the visible agent cursor and detach behavior. Main-session and hardware behavior still need verification after logging into a patched niri session. See the optional [systemd/GDM session examples](references/host-background.md#separate-systemdgdm-session) for a separate login entry. `stop-host` is a hotkey target for detaching the active native attachment.
 
+In a shared window, ordinary `click` and `type` address accessible buttons and
+editable fields while the user types in another field. The agent keeps its own
+insertion position. v3 draws the agent arrow using the desktop's Xcursor theme,
+size and hotspot, with a distinct fill color for each agent.
+
 To work in the *same window* while the user types, the experimental
 `scripts/bgui_widgets.py inspect --window ID` lists named actions exposed by the
 application through AT-SPI. `scripts/bgui_widgets.py invoke --window ID --token TOKEN`

@@ -90,6 +90,35 @@ def test():
             keys("type", "left")
             keys("key", "Tab")
             keys("type", "before")
+            # Ordinary bgui commands route to the selected widget even with real
+            # focus in the other entry in this very window.
+            import host_background as host
+            import bgui as core
+            win = client.windows.return_value[0]
+            win.update(is_focused=True, layout={"window_size": [400, 200]})
+            state = {"id": "shared", "target": host.pin(win), "host_env": {}, "color": 1,
+                     "capture": {"window_id": 7, "window_size": [400, 200], "width": 800,
+                                 "height": 600, "scale": 1, "geometry_x": 0, "geometry_y": 0}}
+            def normal(*argv):
+                return host.input_action(core.parser().parse_args([argv[0], "shared", *argv[1:]]),
+                                         Path(tmp), state, client)
+            root = window_root(Atspi.get_desktop(0), proc.pid, TITLE)
+            def descendants(node):
+                yield node
+                for child in widgets.children(node):
+                    yield from descendants(child)
+            controls = list(descendants(root))
+            first = next(n for n in controls if n.get_role() == Atspi.Role.TEXT and Atspi.Text.get_text(n, 0, -1) == "left")
+            def center(n):
+                b = n.get_extents(Atspi.CoordType.WINDOW)
+                return [str(b.x+b.width-3), str(b.y+b.height//2)]
+            assert normal("click", *center(first))["shared_action"] == "select-entry"
+            assert normal("type", "Фокус ✓")["shared_action"] == "insert"
+            count = next(n for n in controls if n.get_name() == "Count")
+            assert normal("click", *center(count))["shared_action"] == "invoke"
+            keys("type", "--", "-middle")
+            assert json.loads(path.read_text()) == ["leftФокус ✓", "before-middle", 1, True]
+            client.request.reset_mock()
             result = cli("invoke", "--token", action["token"])
             assert result["indicator"] and result["invoked"] == action
             client.request.assert_called_once()
@@ -97,7 +126,7 @@ def test():
             keys("type", "after")
             time.sleep(.2)
             result = json.loads(path.read_text())
-            assert result == ["left", "beforeafter", 1, True], result
+            assert result == ["leftФокус ✓", "before-middleafter", 2, True], result
             print("User switched fields; agent invoked Count once; typing continued in the second field.")
         finally:
             proc.terminate()

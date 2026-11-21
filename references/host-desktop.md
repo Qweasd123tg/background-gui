@@ -1,7 +1,7 @@
 # Native desktop pointer (experimental)
 
 `host-desktop` draws an agent cursor above the native desktop and routes input to
-the Wayland surface under it. The current patch draws a violet arrow and an amber
+the Wayland surface under it. The v3 patch tints the desktop theme’s default arrow violet and draws an amber
 ring at the button-down location. It covers visible windows, their popups and
 layer-shell panels. Clicking selects the agent's keyboard target. Hovering another
 window does not change that target. The real seat pointer location, keyboard focus
@@ -86,7 +86,7 @@ git -C /absolute/niri apply /absolute/background-gui/assets/niri-agent-desktop.p
 cd /absolute/niri
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v2
+export NIRI_BUILD_VERSION_STRING=26.04-agent-desktop-v3
 cargo test --locked --release --lib -j 2 agent_input::
 cargo build --locked --release --bin niri -j 2
 ```
