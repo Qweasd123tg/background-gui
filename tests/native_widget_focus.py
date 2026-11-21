@@ -103,6 +103,23 @@ def test():
                 return host.input_action(core.parser().parse_args([argv[0], "shared", *argv[1:]]),
                                          Path(tmp), state, client)
             root = window_root(Atspi.get_desktop(0), proc.pid, TITLE)
+            # Firefox with a CSD shadow reports its root and link in surface
+            # coordinates. Exercise the two directions using the observed inset.
+            from types import SimpleNamespace
+            frame, link = mock.Mock(), mock.Mock()
+            frame.path, link.path = "/window", "/new"
+            frame.app.bus_name = link.app.bus_name = ":test"
+            frame.get_extents.return_value = SimpleNamespace(x=20, y=20, width=702, height=903)
+            link.get_extents.return_value = SimpleNamespace(x=50, y=130, width=23, height=16)
+            frame.get_accessible_at_point.return_value = link
+            link.get_accessible_at_point.return_value = None
+            link.get_parent.return_value = frame
+            link.get_role.return_value = Atspi.Role.LINK
+            link.get_state_set.return_value.contains.side_effect = lambda flag: flag == Atspi.StateType.SENSITIVE
+            with mock.patch.object(widgets, "window_root", return_value=frame):
+                _, bounds = widgets.inspect_click(state, win, {"x": 41, "y": 118})
+            frame.get_accessible_at_point.assert_called_once_with(61, 138, Atspi.CoordType.WINDOW)
+            assert bounds == [30, 110, 23, 16], bounds
             def descendants(node):
                 yield node
                 for child in widgets.children(node):
